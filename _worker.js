@@ -1,0 +1,856 @@
+import { connect } from "cloudflare:sockets";
+
+// Variabel & Konstanta
+const HORSE_PROTO = atob("dHJvamFu");
+const FLASH_PROTO = atob("dm1lc3M=");
+const NEKO_PROTO = atob("dmxlc3M=");
+const V2_PROTO = atob("djJyYXk=");
+
+const PORTS = [443, 80];
+const PROTOCOLS = [HORSE_PROTO, FLASH_PROTO, NEKO_PROTO, "ss"];
+const SUB_PAGE_URL = "https://foolvpn.web.id/nautica";
+const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
+const PRX_BANK_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
+const DNS_SERVER_ADDRESS = "8.8.8.8";
+const DNS_SERVER_PORT = 53;
+const RELAY_SERVER_UDP = {
+  host: "udp-relay.hobihaus.space",
+  port: 7300,
+};
+const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.web.id/api/v1/check";
+const CONVERTER_URL = "https://api.foolvpn.web.id/convert";
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+const CORS_HEADER_OPTIONS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+  "Access-Control-Max-Age": "86400",
+};
+
+// Konstanta Kriptografi (Base64 Encoded)
+const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
+const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
+const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
+const SALT_A4 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2U=");
+const SALT_B1 = atob("QUVBRCBSZXNwIEhlYWRlciBMZW4gS2V5");
+const SALT_B2 = atob("QUVBRCBSZXNwIEhlYWRlciBMZW4gSVY=");
+const SALT_B3 = atob("QUVBRCBSZXNwIEhlYWRlciBLZXk=");
+const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
+
+// Sistem Cache
+const CACHE_TTL = 60000;
+let cacheKV = { data: null, lastFetch: 0 };
+let cacheBank = { data: [], lastFetch: 0 };
+
+async function getKVPrxList(kvPrxUrl = KV_PRX_URL) {
+  const now = Date.now();
+  if (cacheKV.data && (now - cacheKV.lastFetch < CACHE_TTL)) {
+    return cacheKV.data;
+  }
+  const response = await fetch(kvPrxUrl);
+  if (response.status === 200) {
+    cacheKV.data = await response.json();
+    cacheKV.lastFetch = now;
+    return cacheKV.data;
+  }
+  return cacheKV.data || {};
+}
+
+async function getPrxList(prxBankUrl = PRX_BANK_URL) {
+  const now = Date.now();
+  if (cacheBank.data.length > 0 && (now - cacheBank.lastFetch < CACHE_TTL) && prxBankUrl === PRX_BANK_URL) {
+    return cacheBank.data;
+  }
+  const response = await fetch(prxBankUrl);
+  if (response.status === 200) {
+    const text = await response.text();
+    const prxString = text.split("\n").filter(Boolean);
+    const parsedData = prxString
+      .map((entry) => {
+        const [ip, port, country, org] = entry.split(",");
+        return {
+          prxIP: ip || "Unknown",
+          prxPort: port || "Unknown",
+          country: country || "Unknown",
+          org: org || "Unknown Org",
+        };
+      }).filter(Boolean);
+      
+    if (prxBankUrl === PRX_BANK_URL) {
+        cacheBank.data = parsedData;
+        cacheBank.lastFetch = now;
+    }
+    return parsedData;
+  }
+  return cacheBank.data || [];
+}
+
+async function reverseWeb(request, target, targetPath) {
+  const targetUrl = new URL(request.url);
+  const targetChunk = target.split(":");
+  targetUrl.hostname = targetChunk[0];
+  targetUrl.port = targetChunk[1]?.toString() || "443";
+  targetUrl.pathname = targetPath || targetUrl.pathname;
+
+  const modifiedRequest = new Request(targetUrl, request);
+  modifiedRequest.headers.set("X-Forwarded-Host", request.headers.get("Host"));
+
+  const response = await fetch(modifiedRequest);
+  const newResponse = new Response(response.body, response);
+  Object.entries(CORS_HEADER_OPTIONS).forEach(([key, value]) => newResponse.headers.set(key, value));
+  newResponse.headers.set("X-Proxied-By", "Cloudflare Worker");
+  return newResponse;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const url = new URL(request.url);
+      const APP_DOMAIN = url.hostname;
+      const serviceName = APP_DOMAIN.split(".")[0];
+      let prxIP = "";
+
+      const upgradeHeader = request.headers.get("Upgrade");
+
+      if (upgradeHeader === "websocket") {
+        const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
+        if (url.pathname.length === 3 || url.pathname.match(",")) {
+          const prxKeys = url.pathname.replace("/", "").toUpperCase().split(",");
+          const prxKey = prxKeys[Math.floor(Math.random() * prxKeys.length)];
+          const kvPrx = await getKVPrxList();
+          prxIP = kvPrx[prxKey][Math.floor(Math.random() * kvPrx[prxKey].length)];
+          return await websocketHandler(request, prxIP);
+        } else if (prxMatch) {
+          prxIP = prxMatch[1];
+          return await websocketHandler(request, prxIP);
+        }
+      }
+
+      if (url.pathname.startsWith("/sub")) {
+        return Response.redirect(`${SUB_PAGE_URL}?host=${APP_DOMAIN}`, 301);
+      } else if (url.pathname.startsWith("/check")) {
+        const target = url.searchParams.get("target").split(":");
+        const result = await checkPrxHealth(target[0], target[1] || "443");
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" },
+        });
+      } else if (url.pathname.startsWith("/api/v1")) {
+        const apiPath = url.pathname.replace("/api/v1", "");
+
+        if (apiPath.startsWith("/sub")) {
+          const filterCC = url.searchParams.get("cc")?.split(",") || [];
+          const filterPort = url.searchParams.get("port")?.split(",") || PORTS;
+          const filterVPN = url.searchParams.get("vpn")?.split(",") || PROTOCOLS;
+          const filterLimit = parseInt(url.searchParams.get("limit")) || 10;
+          const filterFormat = url.searchParams.get("format") || "raw";
+          const fillerDomain = url.searchParams.get("domain") || APP_DOMAIN;
+          const prxBankUrl = url.searchParams.get("prx-list") || env.PRX_BANK_URL;
+
+          let prxList = await getPrxList(prxBankUrl);
+          if (filterCC.length) prxList = prxList.filter((prx) => filterCC.includes(prx.country));
+          shuffleArray(prxList);
+
+          const uuid = crypto.randomUUID();
+          const result = [];
+          
+          for (const prx of prxList) {
+            const uri = new URL(`${HORSE_PROTO}://${fillerDomain}`);
+            uri.searchParams.set("encryption", "none");
+            uri.searchParams.set("type", "ws");
+            uri.searchParams.set("host", APP_DOMAIN);
+
+            for (const port of filterPort) {
+              for (const protocol of filterVPN) {
+                if (result.length >= filterLimit) break;
+
+                uri.protocol = protocol;
+                uri.port = port.toString();
+                if (protocol === "ss") {
+                  uri.username = btoa(`none:${uuid}`);
+                  uri.searchParams.set("plugin", `${V2_PROTO}-plugin${port == 80 ? "" : ";tls"};mux=0;mode=websocket;path=/${prx.prxIP}-${prx.prxPort};host=${APP_DOMAIN}`);
+                } else {
+                  uri.username = uuid;
+                }
+
+                uri.searchParams.set("security", port == 443 ? "tls" : "none");
+                uri.searchParams.set("sni", port == 80 && protocol == FLASH_PROTO ? "" : APP_DOMAIN);
+                uri.searchParams.set("path", `/${prx.prxIP}-${prx.prxPort}`);
+                uri.hash = `${result.length + 1} ${getFlagEmoji(prx.country)} ${prx.org} WS ${port == 443 ? "TLS" : "NTLS"} [${serviceName}]`;
+                result.push(uri.toString());
+              }
+            }
+          }
+
+          let finalResult = "";
+          switch (filterFormat) {
+            case "raw": finalResult = result.join("\n"); break;
+            case V2_PROTO: finalResult = btoa(result.join("\n")); break;
+            case NEKO_PROTO:
+            case "sfa":
+            case "bfr":
+              const res = await fetch(CONVERTER_URL, {
+                method: "POST",
+                body: JSON.stringify({ url: result.join(","), format: filterFormat, template: "cf" }),
+              });
+              if (res.status === 200) finalResult = await res.text();
+              else return new Response(res.statusText, { status: res.status, headers: CORS_HEADER_OPTIONS });
+              break;
+          }
+          return new Response(finalResult, { status: 200, headers: CORS_HEADER_OPTIONS });
+          
+        } else if (apiPath.startsWith("/myip")) {
+          return new Response(
+            JSON.stringify({
+              ip: request.headers.get("cf-connecting-ipv6") || request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip"),
+              colo: request.headers.get("cf-ray")?.split("-")[1],
+              ...request.cf,
+            }),
+            { headers: CORS_HEADER_OPTIONS }
+          );
+        }
+      }
+
+      const targetReversePrx = env.REVERSE_PRX_TARGET || "example.com";
+      return await reverseWeb(request, targetReversePrx);
+      
+    } catch (err) {
+      return new Response(`An error occurred: ${err.toString()}`, { status: 500, headers: CORS_HEADER_OPTIONS });
+    }
+  },
+};
+
+async function websocketHandler(request, resolvedPrxIP) {
+  const webSocketPair = new WebSocketPair();
+  const [client, webSocket] = Object.values(webSocketPair);
+  webSocket.accept();
+
+  const log = () => {}; 
+  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+
+  let remoteSocketWrapper = { value: null };
+  let isDNS = false;
+
+  readableWebSocketStream.pipeTo(
+    new WritableStream({
+      async write(chunk, controller) {
+        if (isDNS) {
+          return handleUDPOutbound(DNS_SERVER_ADDRESS, DNS_SERVER_PORT, chunk, webSocket, null, log, RELAY_SERVER_UDP);
+        }
+        if (remoteSocketWrapper.value) {
+          const writer = remoteSocketWrapper.value.writable.getWriter();
+          await writer.write(chunk);
+          writer.releaseLock();
+          return;
+        }
+
+        const protocol = await protocolSniffer(chunk);
+        let protocolHeader;
+
+        if (protocol === HORSE_PROTO) protocolHeader = readHorseHeader(chunk);
+        else if (protocol === FLASH_PROTO) protocolHeader = await readStreamHeader(chunk);
+        else if (protocol === NEKO_PROTO) protocolHeader = readNekoHeader(chunk);
+        else if (protocol === "ss") protocolHeader = readSsHeader(chunk);
+        else throw new Error("Unknown Protocol!");
+
+        if (protocolHeader.hasError) throw new Error(protocolHeader.message);
+
+        let responseHeader = protocolHeader.version;
+        if (protocol === FLASH_PROTO && protocolHeader.needsResponse) {
+          responseHeader = await generateStreamResponseHeader(protocolHeader.responseOptions, protocolHeader.encKey, protocolHeader.encIv);
+        }
+
+        if (protocolHeader.isUDP) {
+          if (protocolHeader.portRemote === 53) isDNS = true;
+          return handleUDPOutbound(
+            isDNS ? DNS_SERVER_ADDRESS : protocolHeader.addressRemote,
+            isDNS ? DNS_SERVER_PORT : protocolHeader.portRemote,
+            chunk, webSocket, responseHeader, log, RELAY_SERVER_UDP
+          );
+        }
+
+        handleTCPOutBound(remoteSocketWrapper, protocolHeader.addressRemote, protocolHeader.portRemote, protocolHeader.rawClientData, webSocket, responseHeader, log, resolvedPrxIP);
+      },
+      close() { log(`readableWebSocketStream closed`); },
+      abort(reason) { log(`readableWebSocketStream aborted`); },
+    })
+  ).catch(() => {});
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+async function protocolSniffer(buffer) {
+  if (buffer.byteLength >= 62) {
+    const horseDelimiter = new Uint8Array(buffer.slice(56, 60));
+    if (horseDelimiter[0] === 0x0d && horseDelimiter[1] === 0x0a) {
+      if (horseDelimiter[2] === 0x01 || horseDelimiter[2] === 0x03 || horseDelimiter[2] === 0x7f) {
+        if (horseDelimiter[3] === 0x01 || horseDelimiter[3] === 0x03 || horseDelimiter[3] === 0x04) {
+          return HORSE_PROTO;
+        }
+      }
+    }
+  }
+
+  if (buffer.byteLength >= 18) {
+    const version = new Uint8Array(buffer.slice(0, 1))[0];
+    if (version === 0) {
+      const protocolUuid = new Uint8Array(buffer.slice(1, 17));
+      if (arrayBufferToHex(protocolUuid).match(/^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a-f]{12}$/i)) {
+        return NEKO_PROTO;
+      }
+    }
+  }
+
+  if (buffer.byteLength >= 42) {
+    const firstByte = new Uint8Array(buffer.slice(0, 1))[0];
+    if (firstByte === 0x01 || firstByte === 0x03 || firstByte === 0x04) {
+      return "ss";
+    }
+    return FLASH_PROTO;
+  }
+  return "ss";
+}
+
+async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
+  try {
+    const key = (await sha256(encKey)).slice(0, 16);
+    const iv = (await sha256(encIv)).slice(0, 16);
+
+    const lengthKey = (await kdf(key, [SALT_B1])).slice(0, 16);
+    const lengthIv = (await kdf(iv, [SALT_B2])).slice(0, 12);
+
+    const lengthData = new Uint8Array(2);
+    lengthData[0] = 0;
+    lengthData[1] = 4;
+
+    const encryptedLength = await aesGcmEncrypt(lengthKey, lengthIv, lengthData, new Uint8Array(0));
+
+    const headerPayload = new Uint8Array([responseOptions[0], 0x00, 0x00, 0x00]);
+
+    const payloadKey = (await kdf(key, [SALT_B3])).slice(0, 16);
+    const payloadIv = (await kdf(iv, [SALT_B4])).slice(0, 12);
+
+    const encryptedPayload = await aesGcmEncrypt(payloadKey, payloadIv, headerPayload, new Uint8Array(0));
+
+    const response = new Uint8Array(encryptedLength.length + encryptedPayload.length);
+    response.set(encryptedLength, 0);
+    response.set(encryptedPayload, encryptedLength.length);
+
+    return response;
+  } catch (e) {
+    return new Uint8Array(0);
+  }
+}
+
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, resolvedPrxIP) {
+  async function connectAndWrite(address, port) {
+    const tcpSocket = connect({ hostname: address, port: port });
+    remoteSocket.value = tcpSocket;
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(rawClientData);
+    writer.releaseLock();
+    return tcpSocket;
+  }
+
+  async function retry() {
+    const tcpSocket = await connectAndWrite(
+      resolvedPrxIP.split(/[:=-]/)[0] || addressRemote,
+      resolvedPrxIP.split(/[:=-]/)[1] || portRemote,
+    );
+    tcpSocket.closed.catch(() => {}).finally(() => safeCloseWebSocket(webSocket));
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+  }
+
+  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+  remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+}
+
+async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
+  try {
+    let protocolHeader = responseHeader;
+    const tcpSocket = connect({ hostname: relay.host, port: relay.port });
+
+    const header = `udp:${targetAddress}:${targetPort}`;
+    const headerBuffer = new TextEncoder().encode(header);
+    const separator = new Uint8Array([0x7c]);
+    const relayMessage = new Uint8Array(headerBuffer.length + separator.length + dataChunk.byteLength);
+    relayMessage.set(headerBuffer, 0);
+    relayMessage.set(separator, headerBuffer.length);
+    relayMessage.set(new Uint8Array(dataChunk), headerBuffer.length + separator.length);
+
+    const writer = tcpSocket.writable.getWriter();
+    await writer.write(relayMessage);
+    writer.releaseLock();
+
+    await tcpSocket.readable.pipeTo(
+      new WritableStream({
+        async write(chunk) {
+          if (webSocket.readyState === WS_READY_STATE_OPEN) {
+            if (protocolHeader) {
+              webSocket.send(await new Blob([protocolHeader, chunk]).arrayBuffer());
+              protocolHeader = null;
+            } else {
+              webSocket.send(chunk);
+            }
+          }
+        },
+        close() {},
+        abort() {},
+      })
+    );
+  } catch (e) {}
+}
+
+function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
+  let readableStreamCancel = false;
+  const stream = new ReadableStream({
+    start(controller) {
+      webSocketServer.addEventListener("message", (event) => {
+        if (readableStreamCancel) return;
+        controller.enqueue(event.data);
+      });
+      webSocketServer.addEventListener("close", () => {
+        safeCloseWebSocket(webSocketServer);
+        if (readableStreamCancel) return;
+        controller.close();
+      });
+      webSocketServer.addEventListener("error", (err) => {
+        controller.error(err);
+      });
+      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+      if (error) {
+        controller.error(error);
+      } else if (earlyData) {
+        controller.enqueue(earlyData);
+      }
+    },
+    pull() {},
+    cancel() {
+      readableStreamCancel = true;
+      safeCloseWebSocket(webSocketServer);
+    },
+  });
+  return stream;
+}
+
+async function md5(...inputs) {
+  const combined = new Uint8Array(inputs.reduce((acc, input) => acc + input.length, 0));
+  let offset = 0;
+  for (const input of inputs) {
+    combined.set(new Uint8Array(input), offset);
+    offset += input.length;
+  }
+  
+  // Fungsi MD5 Pure JS untuk menghindari crash 1101
+  function cryptMD5(bytes) {
+    let words = [];
+    for (let i = 0; i < bytes.length; i++) words[i >> 2] |= bytes[i] << ((i % 4) * 8);
+    let x = words, n = bytes.length * 8, a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+    for (let i = 0; i < x.length; i += 16) {
+      let olda = a, oldb = b, oldc = c, oldd = d;
+      a = md5_ff(a, b, c, d, x[i+0], 7 , -680876936); d = md5_ff(d, a, b, c, x[i+1], 12, -389564586);
+      c = md5_ff(c, d, a, b, x[i+2], 17,  606105819); b = md5_ff(b, c, d, a, x[i+3], 22, -1044525330);
+      a = md5_ff(a, b, c, d, x[i+4], 7 , -176411697); d = md5_ff(d, a, b, c, x[i+5], 12,  1200080426);
+      c = md5_ff(c, d, a, b, x[i+6], 17, -1473231341);b = md5_ff(b, c, d, a, x[i+7], 22, -45705983);
+      a = md5_ff(a, b, c, d, x[i+8], 7 ,  1770035412);d = md5_ff(d, a, b, c, x[i+9], 12, -1958414417);
+      c = md5_ff(c, d, a, b, x[i+10],17, -42063);     b = md5_ff(b, c, d, a, x[i+11],22, -1990404162);
+      a = md5_ff(a, b, c, d, x[i+12],7 ,  1804603682);d = md5_ff(d, a, b, c, x[i+13],12, -40341101);
+      c = md5_ff(c, d, a, b, x[i+14],17, -1502002290);b = md5_ff(b, c, d, a, x[i+15],22,  1236535329);
+      a = md5_gg(a, b, c, d, x[i+1], 5 , -165796510); d = md5_gg(d, a, b, c, x[i+6], 9 , -1069501632);
+      c = md5_gg(c, d, a, b, x[i+11],14,  643717713); b = md5_gg(b, c, d, a, x[i+0], 20, -373897302);
+      a = md5_gg(a, b, c, d, x[i+5], 5 , -701558691); d = md5_gg(d, a, b, c, x[i+10],9 ,  38016083);
+      c = md5_gg(c, d, a, b, x[i+15],14, -660478335); b = md5_gg(b, c, d, a, x[i+4], 20, -405537848);
+      a = md5_gg(a, b, c, d, x[i+9], 5 ,  568446438);  d = md5_gg(d, a, b, c, x[i+14],9 , -1019803690);
+      c = md5_gg(c, d, a, b, x[i+3], 14, -187363961); b = md5_gg(b, c, d, a, x[i+8], 20,  1163531501);
+      a = md5_gg(a, b, c, d, x[i+13],5 , -1444681467);d = md5_gg(d, a, b, c, x[i+2], 9 , -51403784);
+      c = md5_gg(c, d, a, b, x[i+7], 14,  1735328473);b = md5_gg(b, c, d, a, x[i+12],20, -1926607734);
+      a = md5_hh(a, b, c, d, x[i+5], 4 , -378558);     d = md5_hh(d, a, b, c, x[i+8], 11, -2022574463);
+      c = md5_hh(c, d, a, b, x[i+11],16,  1839030562);b = md5_hh(b, c, d, a, x[i+14],23, -35309556);
+      a = md5_hh(a, b, c, d, x[i+1], 4 , -1530992060);d = md5_hh(d, a, b, c, x[i+4], 11,  1272893353);
+      c = md5_hh(c, d, a, b, x[i+7], 16, -155497632); b = md5_hh(b, c, d, a, x[i+10],23, -1094730640);
+      a = md5_hh(a, b, c, d, x[i+13],4 ,  681279174);  d = md5_hh(d, a, b, c, x[i+0], 11, -358537222);
+      c = md5_hh(c, d, a, b, x[i+3], 16, -722521979); b = md5_hh(b, c, d, a, x[i+6], 23,  76029189);
+      a = md5_hh(a, b, c, d, x[i+9], 4 , -640364487); d = md5_hh(d, a, b, c, x[i+12],11, -421815835);
+      c = md5_hh(c, d, a, b, x[i+2], 16,  530742520);  b = md5_hh(b, c, d, a, x[i+5], 23, -995338651);
+      a = md5_ii(a, b, c, d, x[i+0], 6 , -198630844); d = md5_ii(d, a, b, c, x[i+7], 10,  1126891415);
+      c = md5_ii(c, d, a, b, x[i+14],15, -1416354905);b = md5_ii(b, c, d, a, x[i+5], 21, -57434055);
+      a = md5_ii(a, b, c, d, x[i+12],6 ,  1700485571);d = md5_ii(d, a, b, c, x[i+3], 10, -1894986606);
+      c = md5_ii(c, d, a, b, x[i+10],15, -1051523);    b = md5_ii(b, c, d, a, x[i+11],21, -2054922799);
+      a = md5_ii(a, b, c, d, x[i+2], 6 ,  1873313359);d = md5_ii(d, a, b, c, x[i+9], 10, -30611744);
+      c = md5_ii(c, d, a, b, x[i+16],15, -1560198380);b = md5_ii(b, c, d, a, x[i+1], 21,  1309151649);
+      a = md5_ii(a, b, c, d, x[i+8], 6 , -145523070); d = md5_ii(d, a, b, c, x[i+15],10, -1120210379);
+      c = md5_ii(c, d, a, b, x[i+6], 15,  718787259);  b = md5_ii(b, c, d, a, x[i+13],21, -343485551);
+      a = md5_add(a, olda); b = md5_add(b, oldb); c = md5_add(c, oldc); d = md5_add(d, oldd);
+    }
+    let res = new Uint8Array(16);
+    res[0] = a & 0xFF; res[1] = (a >> 8) & 0xFF; res[2] = (a >> 16) & 0xFF; res[3] = (a >> 24) & 0xFF;
+    res[4] = b & 0xFF; res[5] = (b >> 8) & 0xFF; res[6] = (b >> 16) & 0xFF; res[7] = (b >> 24) & 0xFF;
+    res[8] = c & 0xFF; res[9] = (c >> 8) & 0xFF; res[10] = (c >> 16) & 0xFF; res[11] = (c >> 24) & 0xFF;
+    res[12] = d & 0xFF; res[13] = (d >> 8) & 0xFF; res[14] = (d >> 16) & 0xFF; res[15] = (d >> 24) & 0xFF;
+    return res;
+  }
+  function md5_add(x, y) { return (x + y) & 0xFFFFFFFF; }
+  function md5_cmn(g, a, b, x, s, t) { return md5_add(md5_ccl(md5_add(md5_add(a, g), md5_add(x, t)), s), b); }
+  function md5_ff(a, b, c, d, x, s, t) { return md5_cmn((b & c) | ((~b) & d), a, b, x, s, t); }
+  function md5_gg(a, b, c, d, x, s, t) { return md5_cmn((b & d) | (c & (~d)), a, b, x, s, t); }
+  function md5_hh(a, b, c, d, x, s, t) { return md5_cmn(b ^ c ^ d, a, b, x, s, t); }
+  function md5_ii(a, b, c, d, x, s, t) { return md5_cmn(c ^ (b | (~d)), a, b, x, s, t); }
+  function md5_ccl(x, c) { return (x << c) | (x >>> (32 - c)); }
+
+  return cryptMD5(combined);
+}
+
+
+async function sha256(input) {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", input);
+  return new Uint8Array(hashBuffer);
+}
+
+async function kdf(key, path) {
+  async function recursiveHash(keyBytes, innerHashFn) {
+    return async (data) => {
+      const ipad = new Uint8Array(64);
+      const opad = new Uint8Array(64);
+
+      ipad.set(keyBytes.slice(0, Math.min(64, keyBytes.length)));
+      opad.set(keyBytes.slice(0, Math.min(64, keyBytes.length)));
+
+      for (let i = 0; i < 64; i++) {
+        ipad[i] ^= 0x36;
+        opad[i] ^= 0x5c;
+      }
+
+      const innerData = new Uint8Array(ipad.length + data.length);
+      innerData.set(ipad);
+      innerData.set(data, ipad.length);
+      const innerResult = await innerHashFn(innerData);
+
+      const outerData = new Uint8Array(opad.length + innerResult.length);
+      outerData.set(opad);
+      outerData.set(innerResult, opad.length);
+      return await innerHashFn(outerData);
+    };
+  }
+
+  const sha256Hash = async (data) => new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  let currentHashFn = await recursiveHash(new TextEncoder().encode("VMess AEAD KDF"), sha256Hash);
+
+  for (const salt of path) {
+    const saltBytes = typeof salt === "string" ? new TextEncoder().encode(salt) : new Uint8Array(salt);
+    currentHashFn = await recursiveHash(saltBytes, currentHashFn);
+  }
+  return await currentHashFn(key);
+}
+
+async function aesGcmDecrypt(key, nonce, data, aad) {
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-GCM" }, false, ["decrypt"]);
+  try {
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, cryptoKey, data);
+    return new Uint8Array(decrypted);
+  } catch (e) {
+    throw new Error("AEAD decryption failed");
+  }
+}
+
+async function aesGcmEncrypt(key, nonce, data, aad) {
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-GCM" }, false, ["encrypt"]);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, cryptoKey, data);
+  return new Uint8Array(encrypted);
+}
+
+async function readStreamHeader(buffer) {
+  try {
+    const uuidString = "00000000-0000-0000-0000-000000000000";
+    const uuidBytes = new Uint8Array(
+      uuidString.replace(/-/g, "").match(/.{1,2}/g).map((byte) => parseInt(byte, 16))
+    );
+
+    const authKey = await md5(uuidBytes, new TextEncoder().encode(atob("YzQ4NjE5ZmUtOGYwMi00OWUwLWI5ZTktZWRmNzYzZTE3ZTIx")));
+    const authId = new Uint8Array(buffer.slice(0, 16));
+    const encryptedLength = new Uint8Array(buffer.slice(16, 34));
+    const nonce = new Uint8Array(buffer.slice(34, 42));
+
+    const lengthKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
+    const lengthIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
+    const lengthBytes = await aesGcmDecrypt(lengthKey, lengthIv, encryptedLength, authId);
+    const headerLength = (lengthBytes[0] << 8) | lengthBytes[1];
+
+    const encryptedHeader = new Uint8Array(buffer.slice(42, 42 + headerLength + 16));
+    const payloadKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
+    const payloadIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
+    const headerPayload = await aesGcmDecrypt(payloadKey, payloadIv, encryptedHeader, authId);
+
+    const view = new DataView(headerPayload.buffer);
+    let offset = 0;
+    const version = view.getUint8(offset);
+    offset += 1;
+    if (version !== 1) return { hasError: true, message: `Invalid version` };
+
+    const encIv = new Uint8Array(headerPayload.slice(offset, offset + 16));
+    offset += 16;
+    const encKey = new Uint8Array(headerPayload.slice(offset, offset + 16));
+    offset += 16;
+    const options = new Uint8Array(headerPayload.slice(offset, offset + 4));
+    offset += 4;
+    const cmd = view.getUint8(offset);
+    offset += 1;
+    const isUDP = cmd !== 0x01;
+    const portRemote = view.getUint16(offset, false);
+    offset += 2;
+    const addressType = view.getUint8(offset);
+    offset += 1;
+    let addressRemote = "";
+
+    switch (addressType) {
+      case 1:
+        addressRemote = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
+        offset += 4; break;
+      case 2:
+      case 3:
+        const domainLength = view.getUint8(offset);
+        offset += 1;
+        addressRemote = new TextDecoder().decode(headerPayload.slice(offset, offset + domainLength));
+        offset += domainLength; break;
+      case 4:
+        const ipv6Parts = [];
+        for (let i = 0; i < 8; i++) ipv6Parts.push(view.getUint16(offset + i * 2, false).toString(16));
+        addressRemote = ipv6Parts.join(":");
+        offset += 16; break;
+      default:
+        return { hasError: true, message: `Invalid address type` };
+    }
+
+    const rawDataIndex = 42 + headerLength + 16;
+    return {
+      hasError: false,
+      addressRemote,
+      addressType,
+      portRemote,
+      rawDataIndex,
+      rawClientData: buffer.slice(rawDataIndex),
+      version: new Uint8Array([options[0], 0]),
+      isUDP,
+      needsResponse: true,
+      responseOptions: options,
+      encKey: encKey,
+      encIv: encIv,
+    };
+  } catch (e) {
+    return { hasError: true, message: "Parsing failed" };
+  }
+}
+
+function readSsHeader(ssBuffer) {
+  const view = new DataView(ssBuffer);
+  const addressType = view.getUint8(0);
+  let addressLength = 0, addressValueIndex = 1, addressValue = "";
+
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressValue = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join("."); break;
+    case 3:
+      addressLength = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      addressValueIndex += 1;
+      addressValue = new TextDecoder().decode(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength)); break;
+    case 4:
+      addressLength = 16;
+      const dataView = new DataView(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+      addressValue = ipv6.join(":"); break;
+    default:
+      return { hasError: true, message: `Invalid addressType` };
+  }
+
+  if (!addressValue) return { hasError: true, message: `Address empty` };
+
+  const portIndex = addressValueIndex + addressLength;
+  const portBuffer = ssBuffer.slice(portIndex, portIndex + 2);
+  const portRemote = new DataView(portBuffer).getUint16(0);
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType: addressType,
+    portRemote: portRemote,
+    rawDataIndex: portIndex + 2,
+    rawClientData: ssBuffer.slice(portIndex + 2),
+    version: null,
+    isUDP: portRemote == 53,
+  };
+}
+
+function readNekoHeader(buffer) {
+  const version = new Uint8Array(buffer.slice(0, 1));
+  let isUDP = false;
+  const optLength = new Uint8Array(buffer.slice(17, 18))[0];
+  const cmd = new Uint8Array(buffer.slice(18 + optLength, 18 + optLength + 1))[0];
+  
+  if (cmd === 1) {} 
+  else if (cmd === 2) isUDP = true;
+  else return { hasError: true, message: `Command not supported` };
+  
+  const portIndex = 18 + optLength + 1;
+  const portBuffer = buffer.slice(portIndex, portIndex + 2);
+  const portRemote = new DataView(portBuffer).getUint16(0);
+
+  let addressIndex = portIndex + 2;
+  const addressBuffer = new Uint8Array(buffer.slice(addressIndex, addressIndex + 1));
+  const addressType = addressBuffer[0];
+  let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
+  
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressValue = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + addressLength)).join("."); break;
+    case 2:
+      addressLength = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      addressValueIndex += 1;
+      addressValue = new TextDecoder().decode(buffer.slice(addressValueIndex, addressValueIndex + addressLength)); break;
+    case 3:
+      addressLength = 16;
+      const dataView = new DataView(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+      addressValue = ipv6.join(":"); break;
+    default:
+      return { hasError: true, message: `Invalid addressType` };
+  }
+  
+  if (!addressValue) return { hasError: true, message: `Address empty` };
+
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType: addressType,
+    portRemote: portRemote,
+    rawDataIndex: addressValueIndex + addressLength,
+    rawClientData: buffer.slice(addressValueIndex + addressLength),
+    version: new Uint8Array([version[0], 0]),
+    isUDP: isUDP,
+  };
+}
+
+function readHorseHeader(buffer) {
+  const dataBuffer = buffer.slice(58);
+  if (dataBuffer.byteLength < 6) return { hasError: true, message: "Invalid request data" };
+
+  let isUDP = false;
+  const view = new DataView(dataBuffer);
+  const cmd = view.getUint8(0);
+  if (cmd == 3) isUDP = true;
+  else if (cmd != 1) throw new Error("Unsupported command");
+
+  let addressType = view.getUint8(1);
+  let addressLength = 0, addressValueIndex = 2, addressValue = "";
+  
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressValue = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join("."); break;
+    case 3:
+      addressLength = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      addressValueIndex += 1;
+      addressValue = new TextDecoder().decode(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)); break;
+    case 4:
+      addressLength = 16;
+      const dataView = new DataView(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+      addressValue = ipv6.join(":"); break;
+    default:
+      return { hasError: true, message: `Invalid addressType` };
+  }
+
+  if (!addressValue) return { hasError: true, message: `Address empty` };
+
+  const portIndex = addressValueIndex + addressLength;
+  const portBuffer = dataBuffer.slice(portIndex, portIndex + 2);
+  const portRemote = new DataView(portBuffer).getUint16(0);
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType: addressType,
+    portRemote: portRemote,
+    rawDataIndex: portIndex + 4,
+    rawClientData: dataBuffer.slice(portIndex + 4),
+    version: null,
+    isUDP: isUDP,
+  };
+}
+
+async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, retry, log) {
+  let header = responseHeader;
+  let hasIncomingData = false;
+  await remoteSocket.readable
+    .pipeTo(
+      new WritableStream({
+        start() {},
+        async write(chunk, controller) {
+          hasIncomingData = true;
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            controller.error("Closed");
+          }
+          if (header) {
+            webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+            header = null;
+          } else {
+            webSocket.send(chunk);
+          }
+        },
+        close() {},
+        abort() {},
+      })
+    )
+    .catch(() => safeCloseWebSocket(webSocket));
+    
+  if (hasIncomingData === false && retry) retry();
+}
+
+function safeCloseWebSocket(socket) {
+  try {
+    if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+      socket.close();
+    }
+  } catch (error) {}
+}
+
+async function checkPrxHealth(prxIP, prxPort) {
+  const req = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${prxIP}:${prxPort}`);
+  return await req.json();
+}
+
+function base64ToArrayBuffer(base64Str) {
+  if (!base64Str) return { error: null };
+  try {
+    base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
+    const decode = atob(base64Str);
+    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+    return { earlyData: arryBuffer.buffer, error: null };
+  } catch (error) {
+    return { error };
+  }
+}
+
+function arrayBufferToHex(buffer) {
+  return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+function shuffleArray(array) {
+  let currentIndex = array.length;
+  while (currentIndex != 0) {
+    let randomIndex = Math.floor(Math.random() * currentIndex);
+    currentIndex--;
+    [array[currentIndex], array[randomIndex]] = [array[randomIndex], array[currentIndex]];
+  }
+}
+
+function reverse(s) {
+  return s.split("").reverse().join("");
+}
+
+function getFlagEmoji(isoCode) {
+  const codePoints = isoCode.toUpperCase().split("").map((char) => 127397 + char.charCodeAt(0));
+  return String.fromCodePoint(...codePoints);
+}
