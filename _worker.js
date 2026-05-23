@@ -103,70 +103,46 @@ async function syncProxiesToKV(env) {
   if (!env.PROXY_DB) return { error: "PROXY_DB tidak ditemukan" };
 
   try {
-    // 1. Ambil data mentah dari GitHub terlebih dahulu
+    // 1. Ambil data dari GitHub
     const proxies = await getPrxList(PRX_BANK_URL);
     if (!proxies || proxies.length === 0) {
-      return { status: "error", message: "Gagal ambil data dari GitHub" };
+      throw new Error("Gagal mengambil data dari GitHub");
     }
 
     const allowedCC = ["SG", "ID", "MY"];
-    const ccGroup = { SG: [], ID: [], MY: [] };
-    
-    for (const prx of proxies) {
-      const cc = prx.country.toUpperCase();
-      if (allowedCC.includes(cc)) ccGroup[cc].push(prx);
-    }
-
-    let displayLines = [];
     let allActiveProxies = {}; 
+    let displayLines = [];
     let totalSaved = 0;
 
-    // 2. Filter & Cek Status
+    // 2. Langsung susun data tanpa menunggu hasil health-check
     for (const cc of allowedCC) {
-      const toCheck = ccGroup[cc].slice(0, 12);
-      const checkPromises = toCheck.map(async (prx) => {
-        try {
-          // Timeout ditambahkan agar tidak menggantung terlalu lama
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 2000);
-          
-          const response = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${prx.prxIP}:${prx.prxPort}`, { signal: controller.signal });
-          clearTimeout(timeout);
-          
-          // Jika API error, tetap anggap hidup (Fall-back)
-          return { ipPort: `${prx.prxIP}-${prx.prxPort}`, org: prx.org, isAlive: response.status === 200 };
-        } catch (err) {
-          return { ipPort: `${prx.prxIP}-${prx.prxPort}`, org: prx.org, isAlive: true }; // Fall-back: true
-        }
-      });
-
-      const checkResults = await Promise.all(checkPromises);
+      const filtered = proxies.filter(p => p.country.toUpperCase() === cc).slice(0, 12);
+      
       let count = 1;
-      for (const res of checkResults) {
-        if (res.isAlive) {
-          const key = `${cc.toLowerCase()}${count}`;
-          allActiveProxies[key] = res.ipPort;
-          displayLines.push(`${cc} ${key}=${res.ipPort} ${res.org}`);
-          count++;
-          totalSaved++;
-        }
+      for (const prx of filtered) {
+        const key = `${cc.toLowerCase()}${count}`;
+        const ipPort = `${prx.prxIP}-${prx.prxPort}`;
+        
+        // Langsung masukkan ke objek snapshot tanpa perlu pengecekan status
+        allActiveProxies[key] = ipPort;
+        displayLines.push(`${cc} ${key}=${ipPort} ${prx.org}`);
+        count++;
+        totalSaved++;
       }
     }
 
-    // 3. ATOMIC UPDATE: Hanya simpan jika proses di atas berhasil
-    // Kita tidak melakukan 'flush' total di awal, tapi langsung menimpa data KV
+    // 3. Update Snapshot ke KV
     await env.PROXY_DB.put("ALL_ACTIVE_PROXIES", JSON.stringify(allActiveProxies));
     await env.PROXY_DB.put("HOMEPAGE_CACHE", displayLines.join("\n"));
 
-    return { status: "success", total_active_saved: totalSaved };
+    return { status: "success", total_saved: totalSaved };
 
   } catch (err) {
-    // Jika terjadi error di tengah jalan, fungsi akan berhenti 
-    // dan data lama di KV tetap utuh (tidak terhapus)
-    console.error("Sinkronisasi gagal:", err);
-    return { status: "error", message: err.toString() };
+    console.error("Sinkronisasi gagal:", err.message);
+    return { status: "error", message: err.message };
   }
 }
+
 
 
 export default {
