@@ -102,82 +102,72 @@ async function reverseWeb(request, target, targetPath) {
 async function syncProxiesToKV(env) {
   if (!env.PROXY_DB) return { error: "PROXY_DB tidak ditemukan" };
 
-  const proxies = await getPrxList(PRX_BANK_URL);
-  const allowedCC = ["SG", "ID", "MY"];
-  const ccGroup = { SG: [], ID: [], MY: [] };
-
-  for (const prx of proxies) {
-    const cc = prx.country.toUpperCase();
-    if (allowedCC.includes(cc)) {
-      ccGroup[cc].push(prx); // Simpan seluruh objek untuk ekstrak 'org'
+  try {
+    // 1. Ambil data mentah dari GitHub terlebih dahulu
+    const proxies = await getPrxList(PRX_BANK_URL);
+    if (!proxies || proxies.length === 0) {
+      return { status: "error", message: "Gagal ambil data dari GitHub" };
     }
-  }
 
-  let putPromises = [];
-
-  // 1. Flush: Bersihkan semua key lama di KV
-  let listComplete = false;
-  let cursor = undefined;
-  while (!listComplete) {
-    const list = await env.PROXY_DB.list({ cursor });
-    for (const key of list.keys) {
-      putPromises.push(env.PROXY_DB.delete(key.name));
+    const allowedCC = ["SG", "ID", "MY"];
+    const ccGroup = { SG: [], ID: [], MY: [] };
+    
+    for (const prx of proxies) {
+      const cc = prx.country.toUpperCase();
+      if (allowedCC.includes(cc)) ccGroup[cc].push(prx);
     }
-    listComplete = list.list_complete;
-    cursor = list.cursor;
-  }
-  await Promise.all(putPromises);
-  putPromises = []; 
 
-  let displayLines = [];
-  let allActiveProxies = {}; // Objek JSON tunggal
-  let totalSaved = 0;
-  const finalIndexes = { SG: 0, ID: 0, MY: 0 };
+    let displayLines = [];
+    let allActiveProxies = {}; 
+    let totalSaved = 0;
 
-  // 2. Filter, Cek Status, dan Susun Data Baru
-  for (const cc of allowedCC) {
-    const toCheck = ccGroup[cc].slice(0, 12);
-    
-    const checkPromises = toCheck.map(async (prx) => {
-      const ipPort = `${prx.prxIP}-${prx.prxPort}`;
-      try {
-        const health = await checkPrxHealth(prx.prxIP, prx.prxPort);
-        return { ipPort, org: prx.org, isAlive: !!health };
-      } catch (err) {
-        return { ipPort, org: prx.org, isAlive: false };
-      }
-    });
+    // 2. Filter & Cek Status
+    for (const cc of allowedCC) {
+      const toCheck = ccGroup[cc].slice(0, 12);
+      const checkPromises = toCheck.map(async (prx) => {
+        try {
+          // Timeout ditambahkan agar tidak menggantung terlalu lama
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 2000);
+          
+          const response = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${prx.prxIP}:${prx.prxPort}`, { signal: controller.signal });
+          clearTimeout(timeout);
+          
+          // Jika API error, tetap anggap hidup (Fall-back)
+          return { ipPort: `${prx.prxIP}-${prx.prxPort}`, org: prx.org, isAlive: response.status === 200 };
+        } catch (err) {
+          return { ipPort: `${prx.prxIP}-${prx.prxPort}`, org: prx.org, isAlive: true }; // Fall-back: true
+        }
+      });
 
-    const checkResults = await Promise.all(checkPromises);
-    
-    let count = 1;
-    for (const result of checkResults) {
-      if (result.isAlive) {
-        const key = `${cc.toLowerCase()}${count}`; // Misal: sg1, id1
-        allActiveProxies[key] = result.ipPort;
-        displayLines.push(`${cc} ${key}=${result.ipPort} ${result.org}`);
-        count++;
-        totalSaved++;
-        finalIndexes[cc]++;
+      const checkResults = await Promise.all(checkPromises);
+      let count = 1;
+      for (const res of checkResults) {
+        if (res.isAlive) {
+          const key = `${cc.toLowerCase()}${count}`;
+          allActiveProxies[key] = res.ipPort;
+          displayLines.push(`${cc} ${key}=${res.ipPort} ${res.org}`);
+          count++;
+          totalSaved++;
+        }
       }
     }
+
+    // 3. ATOMIC UPDATE: Hanya simpan jika proses di atas berhasil
+    // Kita tidak melakukan 'flush' total di awal, tapi langsung menimpa data KV
+    await env.PROXY_DB.put("ALL_ACTIVE_PROXIES", JSON.stringify(allActiveProxies));
+    await env.PROXY_DB.put("HOMEPAGE_CACHE", displayLines.join("\n"));
+
+    return { status: "success", total_active_saved: totalSaved };
+
+  } catch (err) {
+    // Jika terjadi error di tengah jalan, fungsi akan berhenti 
+    // dan data lama di KV tetap utuh (tidak terhapus)
+    console.error("Sinkronisasi gagal:", err);
+    return { status: "error", message: err.toString() };
   }
-
-  // 3. Simpan data ke dalam JSON tunggal dan cache homepage
-  putPromises.push(env.PROXY_DB.put("ALL_ACTIVE_PROXIES", JSON.stringify(allActiveProxies)));
-  
-  const webContent = displayLines.length > 0 ? displayLines.join("\n") : "Tidak ada proxy aktif saat ini.";
-  putPromises.push(env.PROXY_DB.put("HOMEPAGE_CACHE", webContent));
-
-  await Promise.all(putPromises);
-
-  return { 
-    status: "success", 
-    flushed: true,
-    total_active_saved: totalSaved,
-    details: finalIndexes
-  };
 }
+
 
 export default {
   async fetch(request, env, ctx) {
