@@ -322,7 +322,6 @@ async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
   }
 }
 
-// PERBAIKAN: localPrxIP diproses terisolasi
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, localPrxIP) {
   async function connectAndWrite(address, port) {
     const tcpSocket = connect({ hostname: address, port: port });
@@ -334,16 +333,38 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
   }
 
   async function retry() {
-    const targetHost = localPrxIP.split(/[:=-]/)[0] || addressRemote;
-    const targetPort = parseInt(localPrxIP.split(/[:=-]/)[1]) || portRemote; 
-    const tcpSocket = await connectAndWrite(targetHost, targetPort);
-    tcpSocket.closed.catch((error) => { console.log("retry tcpSocket closed error", error); }).finally(() => { safeCloseWebSocket(webSocket); });
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+    try {
+      const targetHost = localPrxIP.split(/[:=-]/)[0] || addressRemote;
+      const targetPort = parseInt(localPrxIP.split(/[:=-]/)[1]) || portRemote; 
+      
+      // Mencegah Worker menabrak IP larangan yang bikin "close pipe"
+      if (targetHost === "1.1.1.1") {
+        throw new Error("Target host is fallback 1.1.1.1, connection aborted to prevent loop.");
+      }
+
+      const tcpSocket = await connectAndWrite(targetHost, targetPort);
+      tcpSocket.closed.catch((error) => { 
+        console.log("retry tcpSocket closed error", error); 
+      }).finally(() => { 
+        safeCloseWebSocket(webSocket); 
+      });
+      remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, log);
+    } catch (err) {
+      console.error("Retry connection failed:", err);
+      // Tutup soket dengan aman jika gagal agar v2rayNG tidak close pipe mendadak
+      safeCloseWebSocket(webSocket); 
+    }
   }
 
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-  remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+  try {
+    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, log);
+  } catch (err) {
+    // Jika koneksi langsung gagal sejak awal lempar ke jalur proxy
+    retry();
+  }
 }
+
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay) {
   try {
