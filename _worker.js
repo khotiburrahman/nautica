@@ -1,9 +1,10 @@
 import { connect } from "cloudflare:sockets";
 
-const horse = "dHJvamFu";
-const flash = "dm1lc3M=";
-const neko = "dmxlc3M=";
-const v2 = "djJyYXk=";
+// ===== KONSTANTA & KONFIGURASI =====
+const horse = "dHJvamFu"; // trojan
+const flash = "dm1lc3M="; // vmess
+const neko = "dmxlc3M="; // vless
+const v2 = "djJyYXk="; // v2ray
 
 const PORTS = [443, 80];
 const PROTOCOLS = [atob(horse), atob(flash), atob(neko), "ss"];
@@ -21,6 +22,7 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Max-Age": "86400",
 };
 
+// VMess AEAD Salt Constants
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -30,7 +32,7 @@ const SALT_B2 = atob("QUVBRCBSZXNwIEhlYWRlciBMZW4gSVY=");
 const SALT_B3 = atob("QUVBRCBSZXNwIEhlYWRlciBLZXk=");
 const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
 
-// ----- Fungsi sinkronisasi dari GitHub -----
+// ===== FUNGSI SINKRONISASI GITHUB =====
 async function syncGitHubToKV(env) {
   if (!env.PROXY_DB) return { error: "PROXY_DB tidak ditemukan" };
   const req = await fetch(GITHUB_RAW_URL);
@@ -48,7 +50,7 @@ async function syncGitHubToKV(env) {
   return { error: "Gagal mengambil data dari GitHub" };
 }
 
-// ----- Reverse web -----
+// ===== REVERSE WEB =====
 async function reverseWeb(request, target) {
   const targetUrl = new URL(request.url);
   const targetChunk = target.split(":");
@@ -65,7 +67,7 @@ async function reverseWeb(request, target) {
   return newResponse;
 }
 
-// ----- Utility Functions (diperbaiki) -----
+// ===== UTILITY FUNCTIONS =====
 async function md5(...inputs) {
   const combined = new Uint8Array(inputs.reduce((acc, input) => acc + input.length, 0));
   let offset = 0;
@@ -80,7 +82,7 @@ async function sha256(input) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", input));
 }
 
-// KDF menggunakan HMAC-SHA256 standar
+// KDF menggunakan HMAC-SHA256 (Iterated HMAC sesuai spesifikasi v2ray-core)
 async function kdf(key, path) {
   let result = key;
   for (const salt of path) {
@@ -109,13 +111,13 @@ async function aesGcmEncrypt(key, nonce, data, aad) {
 }
 
 function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) return { error: null };
+  if (!base64Str) return { earlyData: null, error: null };
   try {
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
     const decode = atob(base64Str);
     return { earlyData: Uint8Array.from(decode, (c) => c.charCodeAt(0)).buffer, error: null };
   } catch (error) {
-    return { error };
+    return { earlyData: null, error };
   }
 }
 
@@ -131,7 +133,9 @@ function safeCloseWebSocket(socket) {
   } catch (error) {}
 }
 
-// ----- Protocol Header Parsers (tidak diubah) -----
+// ===== PROTOCOL HEADER PARSERS =====
+
+// VMess AEAD Header Parser
 async function readStreamHeader(buffer) {
   try {
     const uuidBytes = new Uint8Array(buffer.slice(0, 16));
@@ -209,24 +213,31 @@ async function readStreamHeader(buffer) {
   }
 }
 
+// Shadowsocks Header Parser (AEAD & Stream)
 function readSsHeader(ssBuffer) {
   try {
-    const view = new DataView(ssBuffer);
+    // Untuk AEAD: skip salt (16 bytes untuk AES-128/CHACHA20, 32 bytes untuk AES-256)
+    // Untuk simplicity, kita asumsikan salt 16 bytes (AES-128-GCM)
+    const saltLength = 16;
+    const addressStart = saltLength;
+    
+    const view = new DataView(ssBuffer.slice(addressStart));
     const addressType = view.getUint8(0);
     let addressLength = 0, addressValueIndex = 1, addressValue = "";
+    
     switch (addressType) {
-      case 1:
+      case 1: // IPv4
         addressLength = 4;
-        addressValue = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+        addressValue = new Uint8Array(ssBuffer.slice(addressStart + addressValueIndex, addressStart + addressValueIndex + addressLength)).join(".");
         break;
-      case 3:
-        addressLength = new Uint8Array(ssBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+      case 3: // Domain
+        addressLength = new Uint8Array(ssBuffer.slice(addressStart + addressValueIndex, addressStart + addressValueIndex + 1))[0];
         addressValueIndex += 1;
-        addressValue = new TextDecoder().decode(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+        addressValue = new TextDecoder().decode(ssBuffer.slice(addressStart + addressValueIndex, addressStart + addressValueIndex + addressLength));
         break;
-      case 4:
+      case 4: // IPv6
         addressLength = 16;
-        const dataView = new DataView(ssBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+        const dataView = new DataView(ssBuffer.slice(addressStart + addressValueIndex, addressStart + addressValueIndex + addressLength));
         const ipv6 = [];
         for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i*2).toString(16));
         addressValue = ipv6.join(":");
@@ -234,8 +245,10 @@ function readSsHeader(ssBuffer) {
       default:
         return { hasError: true, message: "Unknown address type" };
     }
-    const portIndex = addressValueIndex + addressLength;
+    
+    const portIndex = addressStart + addressValueIndex + addressLength;
     const portRemote = new DataView(ssBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+    
     return {
       hasError: false,
       addressRemote: addressValue,
@@ -251,6 +264,7 @@ function readSsHeader(ssBuffer) {
   }
 }
 
+// VLESS Header Parser
 function readNekoHeader(buffer) {
   try {
     const version = new Uint8Array(buffer.slice(0, 1));
@@ -262,17 +276,18 @@ function readNekoHeader(buffer) {
     let addressIndex = portIndex + 2;
     const addressType = buffer[addressIndex];
     let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
+    
     switch (addressType) {
-      case 1:
+      case 1: // IPv4
         addressLength = 4;
         addressValue = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
         break;
-      case 2:
+      case 2: // Domain
         addressLength = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + 1))[0];
         addressValueIndex += 1;
         addressValue = new TextDecoder().decode(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
         break;
-      case 3:
+      case 3: // IPv6
         addressLength = 16;
         const dataView = new DataView(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
         const ipv6 = [];
@@ -282,6 +297,7 @@ function readNekoHeader(buffer) {
       default:
         return { hasError: true, message: "Unknown address type" };
     }
+    
     return {
       hasError: false,
       addressRemote: addressValue,
@@ -297,6 +313,7 @@ function readNekoHeader(buffer) {
   }
 }
 
+// Trojan Header Parser (DIPERBAIKI: offset rawDataIndex)
 function readHorseHeader(buffer) {
   try {
     const dataBuffer = buffer.slice(58);
@@ -305,17 +322,18 @@ function readHorseHeader(buffer) {
     const isUDP = cmd === 3;
     const addressType = view.getUint8(1);
     let addressLength = 0, addressValueIndex = 2, addressValue = "";
+    
     switch (addressType) {
-      case 1:
+      case 1: // IPv4
         addressLength = 4;
         addressValue = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
         break;
-      case 3:
+      case 3: // Domain
         addressLength = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
         addressValueIndex += 1;
         addressValue = new TextDecoder().decode(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
         break;
-      case 4:
+      case 4: // IPv6
         addressLength = 16;
         const dataView = new DataView(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
         const ipv6 = [];
@@ -325,14 +343,17 @@ function readHorseHeader(buffer) {
       default:
         return { hasError: true, message: "Unknown address type" };
     }
+    
     const portIndex = addressValueIndex + addressLength;
     const portRemote = new DataView(dataBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+    
     return {
       hasError: false,
       addressRemote: addressValue,
       addressType,
       portRemote,
-      rawDataIndex: portIndex + 4,
+      // DIPERBAIKI: Tambahkan 58 karena dataBuffer dimulai dari index 58 buffer asli
+      rawDataIndex: 58 + portIndex + 4,
       rawClientData: dataBuffer.slice(portIndex + 4),
       version: null,
       isUDP,
@@ -342,7 +363,9 @@ function readHorseHeader(buffer) {
   }
 }
 
+// Protocol Sniffer (DIPERBAIKI: hapus regex UUID ketat & false positive SS)
 async function protocolSniffer(buffer) {
+  // Deteksi Trojan (56-60 bytes delimiter)
   if (buffer.byteLength >= 62) {
     const horseDelimiter = new Uint8Array(buffer.slice(56, 60));
     if (horseDelimiter[0] === 0x0d && horseDelimiter[1] === 0x0a &&
@@ -351,24 +374,24 @@ async function protocolSniffer(buffer) {
       return atob(horse);
     }
   }
+  
+  // Deteksi VLESS (version byte = 0)
   if (buffer.byteLength >= 18) {
     const version = new Uint8Array(buffer.slice(0, 1))[0];
     if (version === 0) {
-      const protocolUuid = new Uint8Array(buffer.slice(1, 17));
-      if (arrayBufferToHex(protocolUuid).match(/^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a-f]{12}$/i)) {
-        return atob(neko);
-      }
+      return atob(neko);
     }
   }
+  
+  // Default ke VMess jika bukan Trojan/VLESS (DIPERBAIKI: hapus false positive SS)
   if (buffer.byteLength >= 42) {
-    const firstByte = new Uint8Array(buffer.slice(0, 1))[0];
-    if (firstByte === 0x01 || firstByte === 0x03 || firstByte === 0x04) return "ss";
     return atob(flash);
   }
+  
   return "ss";
 }
 
-// ----- RESPONSE HEADER VMESS YANG DIPERBAIKI -----
+// VMess Response Header Generator (DIPERBAIKI: length data 2 bytes)
 async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
   try {
     const key = (await sha256(encKey)).slice(0, 16);
@@ -376,7 +399,8 @@ async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
     
     const lengthKey = (await kdf(key, [SALT_B1])).slice(0, 16);
     const lengthIv = (await kdf(iv, [SALT_B2])).slice(0, 12);
-    const lengthData = new Uint8Array([0x00, 0x00, 0x00, 0x04]);
+    // DIPERBAIKI: Length data seharusnya 2 bytes, bukan 4 bytes
+    const lengthData = new Uint8Array([0x00, 0x04]); // 2 bytes, value = 4
     const encryptedLength = await aesGcmEncrypt(lengthKey, lengthIv, lengthData, new Uint8Array(0));
     
     const headerPayload = new Uint8Array([responseOptions[0], 0x00, 0x00, 0x00]);
@@ -394,7 +418,7 @@ async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
   }
 }
 
-// ----- WebSocket Handler (diperbaiki) -----
+// ===== WEBSOCKET HANDLER =====
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
   let readableStreamCancel = false;
   return new ReadableStream({
@@ -450,7 +474,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, responseHeader, log) {
   return hasIncomingData;
 }
 
-// handleTCPOutBound yang diperbaiki (payload dikirim sekaligus)
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, payload, webSocket, responseHeader, log, proxyIP, proxyPort) {
   let attempts = 0;
   const maxAttempts = 3;
@@ -539,17 +562,15 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
   let remoteSocketWrapper = { value: null };
   let isDNS = false;
 
-  // Buffer akumulasi untuk deteksi header
   let buffer = new Uint8Array(0);
   let headerParsed = false;
   let protocolHeader = null;
   let responseHeader = null;
   let protocol = null;
-  let initialPayload = null; // data yang akan dikirim setelah koneksi terbuka
+  let initialPayload = null;
 
   const writableStream = new WritableStream({
     async write(chunk, controller) {
-      // Jika sudah ada koneksi TCP, kirim langsung
       if (remoteSocketWrapper.value) {
         const writer = remoteSocketWrapper.value.writable.getWriter();
         await writer.write(chunk);
@@ -557,13 +578,11 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
         return;
       }
 
-      // Akumulasi buffer
       const newBuffer = new Uint8Array(buffer.length + chunk.length);
       newBuffer.set(buffer);
       newBuffer.set(chunk, buffer.length);
       buffer = newBuffer;
 
-      // Jika header sudah diparsing, simpan semua data untuk dikirim nanti
       if (headerParsed) {
         if (!initialPayload) {
           initialPayload = new Uint8Array(0);
@@ -575,12 +594,10 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
         return;
       }
 
-      // Tunggu sampai buffer cukup untuk deteksi (minimal 62 byte)
       if (buffer.length < 62) {
         return;
       }
 
-      // Deteksi protokol
       protocol = await protocolSniffer(buffer);
       let parseResult;
 
@@ -602,7 +619,6 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
       addressLog = protocolHeader.addressRemote;
       portLog = `${protocolHeader.portRemote} -> ${protocolHeader.isUDP ? "UDP" : "TCP"}`;
 
-      // Response header khusus VMess
       if (protocol === atob(flash) && protocolHeader.needsResponse) {
         responseHeader = await generateStreamResponseHeader(
           protocolHeader.responseOptions,
@@ -615,9 +631,7 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
 
       headerParsed = true;
 
-      // Sisa data setelah header (termasuk chunk terakhir)
       const remaining = buffer.slice(protocolHeader.rawDataIndex);
-      // Gabungkan dengan initialPayload (jika ada dari chunk sebelumnya)
       let payloadToSend = remaining;
       if (initialPayload && initialPayload.length > 0) {
         const combined = new Uint8Array(initialPayload.length + remaining.length);
@@ -627,10 +641,8 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
       }
       initialPayload = payloadToSend;
 
-      // Kosongkan buffer utama
       buffer = new Uint8Array(0);
 
-      // Jika UDP
       if (protocolHeader.isUDP) {
         if (protocolHeader.portRemote === 53) {
           isDNS = true;
@@ -639,12 +651,11 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
         return handleUDPOutbound(protocolHeader.addressRemote, protocolHeader.portRemote, chunk, webSocket, responseHeader, log, RELAY_SERVER_UDP);
       }
 
-      // TCP: buat koneksi ke backend dengan payload yang sudah digabung
       handleTCPOutBound(
         remoteSocketWrapper,
         protocolHeader.addressRemote,
         protocolHeader.portRemote,
-        initialPayload, // kirim semua sisa data
+        initialPayload,
         webSocket,
         responseHeader,
         log,
@@ -661,7 +672,7 @@ async function websocketHandler(request, env, proxyIP, proxyPort) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ----- Main Worker -----
+// ===== MAIN WORKER =====
 export default {
   async fetch(request, env, ctx) {
     try {
