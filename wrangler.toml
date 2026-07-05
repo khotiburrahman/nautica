@@ -8,3 +8,7 @@ enabled = true
 
 [observability.logs]
 enabled = true
+
+[[kv_namespaces]]
+binding = "PROXY_DB"
+id = "b5b2d4e9ddf44d5382cba7fbac540536"
