@@ -2,6 +2,7 @@ import { connect } from "cloudflare:sockets";
 
 const SYSTEM_UUID = "";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
+const GITHUB_RAW_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
 
 // --- [ UTILITY & ABSTRACTION ] ---
 
@@ -411,6 +412,28 @@ class SubstreamHandler {
     }
 }
 
+// --- [ HELPER: SINKRONISASI KV ] ---
+
+async function syncGitHubToKV(env) {
+  const kv = env.PROXY_DB || env.MY_KV;
+  if (!kv) return { error: "KV Binding (PROXY_DB/MY_KV) tidak ditemukan" };
+  
+  const req = await fetch(GITHUB_RAW_URL);
+  if (req.status === 200) {
+    const text = await req.text();
+    const lines = text.split('\n').filter(Boolean);
+    const proxies = lines.map(line => {
+      const [prxIP, prxPort, country, org] = line.split(',');
+      return { prxIP, prxPort, country, org };
+    });
+    
+    await kv.put("PROXIES_JSON", JSON.stringify(proxies));
+    await kv.put("HOMEPAGE_CACHE", text);
+    return { status: "success", total: proxies.length };
+  }
+  return { error: "Gagal mengambil data dari GitHub" };
+}
+
 // --- [ CLOUDFLARE ENTRY POINT ] ---
 
 export default {
@@ -418,18 +441,49 @@ export default {
         const isWs = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
         const url = new URL(req.url);
 
-        // Halaman Tampilan Sederhana saat diakses via Browser
+        // Endpoint Manual Sinkronisasi DB KV
+        if (url.pathname === "/sync-db") {
+            const result = await syncGitHubToKV(env);
+            return new Response(JSON.stringify(result), {
+                status: 200,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+
         if ((url.pathname === "/" || url.pathname === "") && !isWs) {
-            return new Response("Server Worker Aktif (Direct Mode). Selamat menikmati.", { 
+            return new Response("Server Worker Aktif (KV Proxy Enabled). Selamat menikmati.", { 
                 status: 200, 
                 headers: { "Content-Type": "text/plain; charset=utf-8" } 
             });
         }
         
         if (isWs) {
-            const pathMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-            const fallbackNode = pathMatch ? pathMatch[1] : null;
+            const kv = env.PROXY_DB || env.MY_KV;
+            let cachedPrxList = [];
+            if (kv) {
+                cachedPrxList = (await kv.get("PROXIES_JSON", "json")) || [];
+            }
+
+            const reqPath = url.pathname.replace(/^\/+/, '').toUpperCase();
+            const ipPortMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
             
+            let prxIP = "";
+            if (ipPortMatch && !/^[A-Z]+$/.test(reqPath)) {
+                // IP:PORT langsung via path URL (Contoh: /1.1.1.1:443)
+                prxIP = ipPortMatch[1];
+            } else if (cachedPrxList.length > 0) {
+                let availableProxies = cachedPrxList;
+                // Mengambil Proxy berdasarkan Kode Negara via Path (Contoh: /SG, /ID, /US)
+                if (/^[A-Z]{2,3}$/.test(reqPath)) {
+                    const filtered = cachedPrxList.filter(p => p.country && p.country.toUpperCase() === reqPath);
+                    if (filtered.length > 0) availableProxies = filtered;
+                }
+                const randomPrx = availableProxies[Math.floor(Math.random() * availableProxies.length)];
+                prxIP = `${randomPrx.prxIP}:${randomPrx.prxPort}`;
+            }
+
+            const fallbackNode = prxIP || null;
+
             const pair = new WebSocketPair();
             const [local, remote] = Object.values(pair);
             remote.accept();
@@ -500,5 +554,10 @@ export default {
         }
 
         return fetch(req);
+    },
+
+    // Cron job untuk sync KV otomatis
+    async scheduled(event, env, ctx) {
+        ctx.waitUntil(syncGitHubToKV(env));
     }
 };
