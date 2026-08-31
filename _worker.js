@@ -1,19 +1,5 @@
 import { connect } from "cloudflare:sockets";
 
-// sebelum deploy script ubah compatible date jadi 2026-02-24 atau 24 februari 2026 di menu settings CF nya agar akun bisa konek
-
-// Uuid generate di https://www.uuidgenerator.net/version4
-
-// jangan ubah logic dibawah ini
-
-// tambahkan uuid khusus protocol VMESS di const SYSTEM_UUID
-
-// Khusus protocol VMESS gunakan cipher: zero
-
-// path config(akun) gunakan /proxy:port atau /proxy-port contoh /36.95.152.58:12137 /36.95.152.58-12137
-
-// Jika protocol VMESS&TROJAN tidak bisa browsing gunakan DNS 8.8.8.8 atau https://1.1.1.1/dns-query atau ceklis HTTP proxy to VPN atau enable fakeDNS kalau pakai v2rayNG
-
 const SYSTEM_UUID = "";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
 
@@ -73,14 +59,14 @@ class ByteReader {
         const type = this.u8();
         let target = "";
         switch (type) {
-            case 1: // IPv4
+            case 1:
                 target = this.take(4).join(".");
                 break;
-            case 2: // Domain
+            case 2:
                 target = ByteUtils.decode(this.take(this.u8()));
                 break;
-            case 3: // Domain (Alt/Some protocols)
-            case 4: // IPv6 (Shared mapped ID)
+            case 3:
+            case 4:
                 if (type === 3 && this.has(this.buf[this.cursor])) {
                     target = ByteUtils.decode(this.take(this.u8()));
                 } else {
@@ -100,7 +86,6 @@ class ByteReader {
 // --- [ CRYPTO ENGINE ] ---
 
 class CryptoEngine {
-    // Standard algorithms kept computationally identical to ensure byte-perfect network compatibility
     static md5(data, salt) {
         let msg = typeof data === 'string' ? ByteUtils.encode(data) : data;
         if (salt) msg = ByteUtils.merge(msg, typeof salt === 'string' ? ByteUtils.encode(salt) : salt);
@@ -243,12 +228,7 @@ class ShadowsocksCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
         const { target, port } = reader.readEndpoint();
-        return { 
-            host: target, port, 
-            isUdp: port === 53, 
-            payload: reader.takeRest(), 
-            replyHead: null 
-        };
+        return { host: target, port, isUdp: port === 53, payload: reader.takeRest(), replyHead: null };
     }
 }
 
@@ -256,9 +236,9 @@ class VlessCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
         const ver = reader.u8();
-        reader.take(16); // skip UUID
+        reader.take(16);
         const optLen = reader.u8();
-        reader.take(optLen); // skip options
+        reader.take(optLen);
         const cmd = reader.u8();
         
         const isUdp = (cmd === Constants.CMD_UDP);
@@ -269,52 +249,38 @@ class VlessCodec extends BaseCodec {
         
         let target = "";
         switch (type) {
-            case 1: // IPv4
-                target = reader.take(4).join(".");
-                break;
-            case 2: // Domain
-                target = ByteUtils.decode(reader.take(reader.u8()));
-                break;
-            case 3: // IPv6
+            case 1: target = reader.take(4).join("."); break;
+            case 2: target = ByteUtils.decode(reader.take(reader.u8())); break;
+            case 3:
                 const parts = [];
                 for (let i = 0; i < 8; i++) parts.push(reader.u16().toString(16));
                 target = parts.join(":");
                 break;
-            default:
-                throw new Error(`VLESS Unknown address format: ${type}`);
+            default: throw new Error(`VLESS Unknown address format: ${type}`);
         }
 
-        return {
-            host: target, port, isUdp,
-            payload: reader.takeRest(),
-            replyHead: new Uint8Array([ver, 0])
-        };
+        return { host: target, port, isUdp, payload: reader.takeRest(), replyHead: new Uint8Array([ver, 0]) };
     }
 }
 
 class TrojanCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
-        reader.take(56); // password hash
-        reader.take(2);  // \r\n
+        reader.take(56);
+        reader.take(2);
         
         const cmd = reader.u8();
         const isUdp = (cmd === Constants.CMD_P1_UDP);
         
-        reader.cursor--; // rewind for shared logic
-        reader.take(1);  // swallow cmd again properly before endpoint
+        reader.cursor--;
+        reader.take(1);
         
         const type = reader.u8();
         reader.cursor--; 
         const { target, port } = reader.readEndpoint();
+        reader.take(2);
         
-        reader.take(2); // final \r\n
-        
-        return {
-            host: target, port, isUdp,
-            payload: reader.takeRest(),
-            replyHead: null
-        };
+        return { host: target, port, isUdp, payload: reader.takeRest(), replyHead: null };
     }
 }
 
@@ -347,7 +313,6 @@ class VmessCodec extends BaseCodec {
         const cmdReader = new ByteReader(cmdData.subarray(40));
         const { target } = cmdReader.readEndpoint();
 
-        // Prepare reply headers
         const rKeyB = CryptoEngine.sha256(kRes).subarray(0, 16);
         const rIvB = CryptoEngine.sha256(iv).subarray(0, 16);
 
@@ -359,11 +324,7 @@ class VmessCodec extends BaseCodec {
         const rpI = CryptoEngine.vmessKDF(rIvB, [Constants.VMESS_SALT.RES_PAY_I]).subarray(0, 12);
         const h2 = await CryptoEngine.gcmProcess('encrypt', rpK, rpI, new Uint8Array([vAuth, 0, 0, 0]));
 
-        return {
-            host: target, port, isUdp: port === 53,
-            payload,
-            replyHead: ByteUtils.merge(h1, h2)
-        };
+        return { host: target, port, isUdp: port === 53, payload, replyHead: ByteUtils.merge(h1, h2) };
     }
 }
 
@@ -455,9 +416,18 @@ class SubstreamHandler {
 export default {
     async fetch(req, env, ctx) {
         const isWs = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
+        const url = new URL(req.url);
+
+        // Halaman Tampilan Sederhana saat diakses via Browser
+        if ((url.pathname === "/" || url.pathname === "") && !isWs) {
+            return new Response("Server Worker Aktif (Direct Mode). Selamat menikmati.", { 
+                status: 200, 
+                headers: { "Content-Type": "text/plain; charset=utf-8" } 
+            });
+        }
         
         if (isWs) {
-            const pathMatch = new URL(req.url).pathname.match(/^\/(.+[:=-]\d+)$/);
+            const pathMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
             const fallbackNode = pathMatch ? pathMatch[1] : null;
             
             const pair = new WebSocketPair();
@@ -499,9 +469,10 @@ export default {
                         return;
                     }
 
+                    // Penentuan Host & Port Outbound
                     const host = fallbackNode ? fallbackNode.split(/[:=-]/)[0] : intent.host;
                     const port = fallbackNode ? parseInt(fallbackNode.split(/[:=-]/)[1], 10) : intent.port;
-                    
+
                     const connectNode = async (h, p) => {
                         const sock = connect({ hostname: h, port: p });
                         activeTarget = sock;
@@ -528,10 +499,6 @@ export default {
             });
         }
 
-        const url = new URL(req.url);
-        if (url.pathname === "/" || url.pathname === "") {
-            return new Response("Selamat menikmati", { status: 404 });
-        }
         return fetch(req);
     }
 };
