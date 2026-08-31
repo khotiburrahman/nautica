@@ -412,7 +412,7 @@ class SubstreamHandler {
     }
 }
 
-// --- [ HELPER: SINKRONISASI KV ] ---
+// --- [ HELPER: SINKRONISASI KV & RESOLVER PATH ] ---
 
 async function syncGitHubToKV(env) {
   const kv = env.PROXY_DB || env.MY_KV;
@@ -424,14 +424,41 @@ async function syncGitHubToKV(env) {
     const lines = text.split('\n').filter(Boolean);
     const proxies = lines.map(line => {
       const [prxIP, prxPort, country, org] = line.split(',');
-      return { prxIP, prxPort, country, org };
+      return { prxIP, prxPort, country: country ? country.trim() : "UN", org: org ? org.trim() : "Unknown" };
     });
     
     await kv.put("PROXIES_JSON", JSON.stringify(proxies));
-    await kv.put("HOMEPAGE_CACHE", text);
     return { status: "success", total: proxies.length };
   }
   return { error: "Gagal mengambil data dari GitHub" };
+}
+
+function resolveProxyFromPath(reqPath, cachedPrxList) {
+    if (!cachedPrxList || cachedPrxList.length === 0) return "";
+
+    // Cek pattern negara + nomor (Contoh: /SG, /SG1, /SG2, /ID1)
+    const match = reqPath.match(/^([A-Z]{2})(\d+)?$/);
+    if (match) {
+        const countryCode = match[1];
+        const indexNum = match[2] ? parseInt(match[2], 10) : null;
+        
+        const filtered = cachedPrxList.filter(p => p.country && p.country.toUpperCase() === countryCode);
+        if (filtered.length > 0) {
+            if (indexNum !== null && indexNum > 0) {
+                // Urutan sesuai angka path (1-based index)
+                const targetProxy = filtered[(indexNum - 1) % filtered.length];
+                return `${targetProxy.prxIP}:${targetProxy.prxPort}`;
+            } else {
+                // Acak dari negara tersebut jika tanpa angka
+                const randomPrx = filtered[Math.floor(Math.random() * filtered.length)];
+                return `${randomPrx.prxIP}:${randomPrx.prxPort}`;
+            }
+        }
+    }
+    
+    // Default fallback acak dari seluruh proxy
+    const randomPrx = cachedPrxList[Math.floor(Math.random() * cachedPrxList.length)];
+    return `${randomPrx.prxIP}:${randomPrx.prxPort}`;
 }
 
 // --- [ CLOUDFLARE ENTRY POINT ] ---
@@ -440,8 +467,9 @@ export default {
     async fetch(req, env, ctx) {
         const isWs = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
         const url = new URL(req.url);
+        const kv = env.PROXY_DB || env.MY_KV;
 
-        // Endpoint Manual Sinkronisasi DB KV
+        // Endpoint Sync Database KV Manual
         if (url.pathname === "/sync-db") {
             const result = await syncGitHubToKV(env);
             return new Response(JSON.stringify(result), {
@@ -450,15 +478,37 @@ export default {
             });
         }
 
+        // Display Tampilan Daftar Proxy di Halaman Utama Domain
         if ((url.pathname === "/" || url.pathname === "") && !isWs) {
-            return new Response("Server Worker Aktif (KV Proxy Enabled). Selamat menikmati.", { 
+            let proxies = [];
+            if (kv) {
+                proxies = (await kv.get("PROXIES_JSON", "json")) || [];
+            }
+
+            let countryCounters = {};
+            let responseLines = [];
+            responseLines.push("=== LIST PROXY AKTIF (KV DATABASE) ===");
+            responseLines.push(`Total Proxy Tersimpan: ${proxies.length}`);
+            responseLines.push("Format: Path | IP:Port | Country | ORG\n");
+
+            if (proxies.length > 0) {
+                proxies.forEach((p) => {
+                    const cc = (p.country || "UN").toUpperCase();
+                    countryCounters[cc] = (countryCounters[cc] || 0) + 1;
+                    const pathCode = `/${cc}${countryCounters[cc]}`;
+                    responseLines.push(`${pathCode.padEnd(6)} : ${p.prxIP}:${p.prxPort} [${cc}] - ${p.org}`);
+                });
+            } else {
+                responseLines.push("Data KV kosong. Jalankan endpoint /sync-db untuk mengisinya.");
+            }
+
+            return new Response(responseLines.join("\n"), { 
                 status: 200, 
                 headers: { "Content-Type": "text/plain; charset=utf-8" } 
             });
         }
         
         if (isWs) {
-            const kv = env.PROXY_DB || env.MY_KV;
             let cachedPrxList = [];
             if (kv) {
                 cachedPrxList = (await kv.get("PROXIES_JSON", "json")) || [];
@@ -468,18 +518,12 @@ export default {
             const ipPortMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
             
             let prxIP = "";
-            if (ipPortMatch && !/^[A-Z]+$/.test(reqPath)) {
-                // IP:PORT langsung via path URL (Contoh: /1.1.1.1:443)
+            if (ipPortMatch && !/^[A-Z]+\d*$/.test(reqPath)) {
+                // IP:PORT langsung via path (Contoh: /1.1.1.1:443)
                 prxIP = ipPortMatch[1];
-            } else if (cachedPrxList.length > 0) {
-                let availableProxies = cachedPrxList;
-                // Mengambil Proxy berdasarkan Kode Negara via Path (Contoh: /SG, /ID, /US)
-                if (/^[A-Z]{2,3}$/.test(reqPath)) {
-                    const filtered = cachedPrxList.filter(p => p.country && p.country.toUpperCase() === reqPath);
-                    if (filtered.length > 0) availableProxies = filtered;
-                }
-                const randomPrx = availableProxies[Math.floor(Math.random() * availableProxies.length)];
-                prxIP = `${randomPrx.prxIP}:${randomPrx.prxPort}`;
+            } else {
+                // Mengambil Proxy berdasarkan Path SG, SG1, SG2, dst.
+                prxIP = resolveProxyFromPath(reqPath, cachedPrxList);
             }
 
             const fallbackNode = prxIP || null;
@@ -523,7 +567,6 @@ export default {
                         return;
                     }
 
-                    // Penentuan Host & Port Outbound
                     const host = fallbackNode ? fallbackNode.split(/[:=-]/)[0] : intent.host;
                     const port = fallbackNode ? parseInt(fallbackNode.split(/[:=-]/)[1], 10) : intent.port;
 
@@ -556,7 +599,6 @@ export default {
         return fetch(req);
     },
 
-    // Cron job untuk sync KV otomatis
     async scheduled(event, env, ctx) {
         ctx.waitUntil(syncGitHubToKV(env));
     }
