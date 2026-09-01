@@ -1,6 +1,6 @@
 import { connect } from "cloudflare:sockets";
 
-const SYSTEM_UUID = "";
+const SYSTEM_UUID = "8fc11e59-39ce-4992-b698-5d96f47106bf";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
 const GITHUB_RAW_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
 
