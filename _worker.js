@@ -90,12 +90,12 @@ class CryptoEngine {
     static md5(data, salt) {
         let msg = typeof data === 'string' ? ByteUtils.encode(data) : data;
         if (salt) msg = ByteUtils.merge(msg, typeof salt === 'string' ? ByteUtils.encode(salt) : salt);
-        
+
         const K = new Uint32Array([
             0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
             0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
             0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
-            0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+            0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
             0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
             0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
             0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
@@ -114,7 +114,7 @@ class CryptoEngine {
         const v = new DataView(padded.buffer);
         v.setUint32(padded.length - 8, (L * 8) >>> 0, true);
         v.setUint32(padded.length - 4, (L * 8 / 0x100000000) >>> 0, true);
-        
+
         for (let i = 0; i < padded.length; i += 64) {
             const M = new Uint32Array(16);
             for (let j = 0; j < 16; j++) M[j] = v.getUint32(i + j * 4, true);
@@ -155,7 +155,7 @@ class CryptoEngine {
         padded.set(msg); padded[L] = 0x80;
         new DataView(padded.buffer).setUint32(padded.length - 4, L * 8, false);
         const W = new Uint32Array(64);
-        
+
         for (let i = 0; i < padded.length; i += 64) {
             const block = new DataView(padded.buffer, i, 64);
             for (let t = 0; t < 16; t++) W[t] = block.getUint32(t * 4, false);
@@ -241,13 +241,13 @@ class VlessCodec extends BaseCodec {
         const optLen = reader.u8();
         reader.take(optLen);
         const cmd = reader.u8();
-        
+
         const isUdp = (cmd === Constants.CMD_UDP);
         if (cmd !== Constants.CMD_TCP && !isUdp) throw new Error("VLESS Cmd Invalid");
-        
+
         const port = reader.u16();
         const type = reader.u8();
-        
+
         let target = "";
         switch (type) {
             case 1: target = reader.take(4).join("."); break;
@@ -269,18 +269,18 @@ class TrojanCodec extends BaseCodec {
         const reader = new ByteReader(buffer);
         reader.take(56);
         reader.take(2);
-        
+
         const cmd = reader.u8();
         const isUdp = (cmd === Constants.CMD_P1_UDP);
-        
+
         reader.cursor--;
         reader.take(1);
-        
+
         const type = reader.u8();
         reader.cursor--; 
         const { target, port } = reader.readEndpoint();
         reader.take(2);
-        
+
         return { host: target, port, isUdp, payload: reader.takeRest(), replyHead: null };
     }
 }
@@ -293,7 +293,7 @@ class VmessCodec extends BaseCodec {
         const nonce = reader.take(8);
 
         const basis = CryptoEngine.md5(ByteUtils.parseUUID(SYSTEM_UUID), "c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        
+
         const kLen = CryptoEngine.vmessKDF(basis, [Constants.VMESS_SALT.LEN_KEY, auth, nonce]).subarray(0, 16);
         const iLen = CryptoEngine.vmessKDF(basis, [Constants.VMESS_SALT.LEN_IV, auth, nonce]).subarray(0, 12);
         const rawLen = await CryptoEngine.gcmProcess('decrypt', kLen, iLen, lenEnc, auth);
@@ -310,7 +310,7 @@ class VmessCodec extends BaseCodec {
         const kRes = cmdData.subarray(17, 33);
         const vAuth = cmdData[33];
         const port = (cmdData[38] << 8) | cmdData[39];
-        
+
         const cmdReader = new ByteReader(cmdData.subarray(40));
         const { target } = cmdReader.readEndpoint();
 
@@ -344,17 +344,17 @@ class ConnectionBroker {
                 if (len > 0 && len < 4096) return new VmessCodec();
             } catch {}
         }
-        
+
         if (buffer.length >= 62) {
             const delim = buffer.slice(56, 60);
             if (delim[0] === 0x0d && delim[1] === 0x0a && [1,3,127].includes(delim[2])) {
                 return new TrojanCodec();
             }
         }
-        
+
         const hex = ByteUtils.hex(buffer.slice(1, 17));
         if (/^\w{8}\w{4}4\w{3}[89ab]\w{3}\w{12}$/.test(hex)) return new VlessCodec();
-        
+
         return new ShadowsocksCodec();
     }
 }
@@ -380,7 +380,7 @@ class SubstreamHandler {
                 });
                 const ans = new Uint8Array(await resp.arrayBuffer());
                 const outLen = new Uint8Array([ans.byteLength >> 8, ans.byteLength & 0xff]);
-                
+
                 if (clientWs.readyState === 1) {
                     if (prefixSent || !responsePrefix) {
                         clientWs.send(ByteUtils.merge(outLen, ans));
@@ -407,7 +407,7 @@ class SubstreamHandler {
                 } else ws.send(c);
             }
         })).catch(() => ws.close());
-        
+
         if (!flowActive && retryFn) retryFn();
     }
 }
@@ -417,7 +417,7 @@ class SubstreamHandler {
 async function syncGitHubToKV(env) {
   const kv = env.PROXY_DB || env.MY_KV;
   if (!kv) return { error: "KV Binding (PROXY_DB/MY_KV) tidak ditemukan" };
-  
+
   const req = await fetch(GITHUB_RAW_URL);
   if (req.status === 200) {
     const text = await req.text();
@@ -426,7 +426,7 @@ async function syncGitHubToKV(env) {
       const [prxIP, prxPort, country, org] = line.split(',');
       return { prxIP, prxPort, country: country ? country.trim() : "UN", org: org ? org.trim() : "Unknown" };
     });
-    
+
     await kv.put("PROXIES_JSON", JSON.stringify(proxies));
     return { status: "success", total: proxies.length };
   }
@@ -436,29 +436,200 @@ async function syncGitHubToKV(env) {
 function resolveProxyFromPath(reqPath, cachedPrxList) {
     if (!cachedPrxList || cachedPrxList.length === 0) return "";
 
-    // Cek pattern negara + nomor (Contoh: /SG, /SG1, /SG2, /ID1)
     const match = reqPath.match(/^([A-Z]{2})(\d+)?$/);
     if (match) {
         const countryCode = match[1];
         const indexNum = match[2] ? parseInt(match[2], 10) : null;
-        
+
         const filtered = cachedPrxList.filter(p => p.country && p.country.toUpperCase() === countryCode);
         if (filtered.length > 0) {
             if (indexNum !== null && indexNum > 0) {
-                // Urutan sesuai angka path (1-based index)
                 const targetProxy = filtered[(indexNum - 1) % filtered.length];
                 return `${targetProxy.prxIP}:${targetProxy.prxPort}`;
             } else {
-                // Acak dari negara tersebut jika tanpa angka
                 const randomPrx = filtered[Math.floor(Math.random() * filtered.length)];
                 return `${randomPrx.prxIP}:${randomPrx.prxPort}`;
             }
         }
     }
-    
-    // Default fallback acak dari seluruh proxy
+
     const randomPrx = cachedPrxList[Math.floor(Math.random() * cachedPrxList.length)];
     return `${randomPrx.prxIP}:${randomPrx.prxPort}`;
+}
+
+// ============================================================
+//  FUNGSI AUTO-DETECT PROXY (HTTP CONNECT -> WEBSOCKET -> RAW)
+// ============================================================
+
+function generateWSKey() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return btoa(String.fromCharCode(...bytes));
+}
+
+function createWSFrame(data) {
+    const len = data.byteLength;
+    const maskKey = new Uint8Array(4);
+    crypto.getRandomValues(maskKey);
+
+    let headerLen = 2 + 4; // basic + mask
+    if (len >= 126) headerLen += (len < 65536 ? 2 : 8);
+    const header = new Uint8Array(headerLen);
+    header[0] = 0x82; // FIN + Binary
+
+    let offset = 2;
+    if (len < 126) {
+        header[1] = 0x80 | len;
+    } else if (len < 65536) {
+        header[1] = 0x80 | 126;
+        new DataView(header.buffer).setUint16(offset, len, false);
+        offset += 2;
+    } else {
+        header[1] = 0x80 | 127;
+        new DataView(header.buffer).setBigUint64(offset, BigInt(len), false);
+        offset += 8;
+    }
+    header.set(maskKey, offset);
+
+    const masked = new Uint8Array(len);
+    for (let i = 0; i < len; i++) masked[i] = data[i] ^ maskKey[i % 4];
+    return ByteUtils.merge(header, masked);
+}
+
+function parseWSFrame(buffer) {
+    if (buffer.length < 2) return null;
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const b2 = view.getUint8(1);
+    let len = b2 & 0x7F;
+    let offset = 2;
+    if (len === 126) { len = view.getUint16(offset); offset += 2; }
+    else if (len === 127) { len = Number(view.getBigUint64(offset)); offset += 8; }
+    const masked = (b2 & 0x80) !== 0;
+    if (masked) offset += 4; // skip mask
+    if (buffer.length < offset + len) return null;
+    const payload = buffer.slice(offset, offset + len);
+    if (masked) {
+        const maskKey = buffer.slice(offset - 4, offset);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+    }
+    return { payload, totalLength: offset + len };
+}
+
+// ----- Fungsi Utama Koneksi Otomatis -----
+async function connectWithAutoDetect(proxyHost, proxyPort, targetHost, targetPort, initialPayload, fallbackNode, activeTarget, intent, remoteWs) {
+    // Jika tidak pakai fallback, langsung ke tujuan
+    if (!fallbackNode) {
+        const sock = connect({ hostname: targetHost, port: targetPort });
+        activeTarget.value = sock;
+        const w = sock.writable.getWriter();
+        await w.write(initialPayload);
+        w.releaseLock();
+        return { socket: sock, isWS: false };
+    }
+
+    const sock = connect({ hostname: proxyHost, port: proxyPort });
+    activeTarget.value = sock;
+    const writer = sock.writable.getWriter();
+
+    // ---- METHOD 1: HTTP CONNECT ----
+    try {
+        const cmd = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`;
+        await writer.write(ByteUtils.encode(cmd));
+        writer.releaseLock();
+
+        const reader = sock.readable.getReader();
+        let resp = new Uint8Array();
+        let isConnected = false;
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            resp = ByteUtils.merge(resp, value);
+            if (ByteUtils.decode(resp).includes("\r\n\r\n")) {
+                if (ByteUtils.decode(resp).includes("200")) isConnected = true;
+                break;
+            }
+        }
+        reader.releaseLock();
+
+        if (isConnected) {
+            const w2 = sock.writable.getWriter();
+            await w2.write(initialPayload);
+            w2.releaseLock();
+            return { socket: sock, isWS: false };
+        }
+    } catch (e) { /* Gagal, lanjut ke WS */ }
+
+    // ---- METHOD 2: WEBSOCKET ----
+    try {
+        const wsKey = generateWSKey();
+        const handshake = `GET / HTTP/1.1\r\nHost: ${proxyHost}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${wsKey}\r\nSec-WebSocket-Version: 13\r\n\r\n`;
+        const w2 = sock.writable.getWriter();
+        await w2.write(ByteUtils.encode(handshake));
+        w2.releaseLock();
+
+        const reader = sock.readable.getReader();
+        let resp = new Uint8Array();
+        let upgraded = false;
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            resp = ByteUtils.merge(resp, value);
+            if (ByteUtils.decode(resp).includes("\r\n\r\n")) {
+                if (ByteUtils.decode(resp).includes("101")) upgraded = true;
+                break;
+            }
+        }
+        reader.releaseLock();
+
+        if (upgraded) {
+            const w3 = sock.writable.getWriter();
+            await w3.write(createWSFrame(initialPayload));
+            w3.releaseLock();
+
+            // Aktifkan relay WS frame
+            let headSent = false;
+            let leftover = new Uint8Array(0);
+
+            (async () => {
+                const upstreamReader = sock.readable.getReader();
+                while (true) {
+                    const { value, done } = await upstreamReader.read();
+                    if (done) break;
+                    let buffer = ByteUtils.merge(leftover, value);
+                    while (buffer.length > 0) {
+                        const result = parseWSFrame(buffer);
+                        if (!result) break;
+                        const { payload, totalLength } = result;
+                        if (remoteWs.readyState === 1) {
+                            const dataToSend = ByteUtils.merge(headSent ? new Uint8Array(0) : (intent.replyHead || new Uint8Array(0)), payload);
+                            remoteWs.send(dataToSend);
+                            if (!headSent && intent.replyHead) headSent = true;
+                        }
+                        buffer = buffer.slice(totalLength);
+                    }
+                    leftover = buffer;
+                }
+            })();
+
+            // Relay dari Client (NekoBox) ke Proxy (bungkus WS frame)
+            remoteWs.addEventListener('message', (e) => {
+                if (sock.writable.locked) return;
+                const raw = typeof e.data === 'string' ? ByteUtils.encode(e.data) : new Uint8Array(e.data);
+                sock.writable.getWriter().then(w => {
+                    w.write(createWSFrame(raw));
+                    w.releaseLock();
+                });
+            });
+
+            return { socket: sock, isWS: true };
+        }
+    } catch (e) { /* Gagal, lanjut ke RAW */ }
+
+    // ---- METHOD 3: RAW TCP ----
+    const w4 = sock.writable.getWriter();
+    await w4.write(initialPayload);
+    w4.releaseLock();
+    return { socket: sock, isWS: false };
 }
 
 // --- [ CLOUDFLARE ENTRY POINT ] ---
@@ -507,7 +678,7 @@ export default {
                 headers: { "Content-Type": "text/plain; charset=utf-8" } 
             });
         }
-        
+
         if (isWs) {
             let cachedPrxList = [];
             if (kv) {
@@ -516,13 +687,11 @@ export default {
 
             const reqPath = url.pathname.replace(/^\/+/, '').toUpperCase();
             const ipPortMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-            
+
             let prxIP = "";
             if (ipPortMatch && !/^[A-Z]+\d*$/.test(reqPath)) {
-                // IP:PORT langsung via path (Contoh: /1.1.1.1:443)
                 prxIP = ipPortMatch[1];
             } else {
-                // Mengambil Proxy berdasarkan Path SG, SG1, SG2, dst.
                 prxIP = resolveProxyFromPath(reqPath, cachedPrxList);
             }
 
@@ -531,10 +700,10 @@ export default {
             const pair = new WebSocketPair();
             const [local, remote] = Object.values(pair);
             remote.accept();
-            
+
             const ed = req.headers.get("sec-websocket-protocol");
             const firstPacket = ByteUtils.b64Decode(ed);
-            
+
             let activeTarget = null, dnsWriter = null;
 
             const wsStream = new ReadableStream({
@@ -567,26 +736,42 @@ export default {
                         return;
                     }
 
+                    // ----- GANTI DENGAN AUTO-DETECT -----
                     const host = fallbackNode ? fallbackNode.split(/[:=-]/)[0] : intent.host;
                     const port = fallbackNode ? parseInt(fallbackNode.split(/[:=-]/)[1], 10) : intent.port;
 
-                    const connectNode = async (h, p) => {
-                        const sock = connect({ hostname: h, port: p });
-                        activeTarget = sock;
-                        const w = sock.writable.getWriter();
-                        await w.write(intent.payload);
-                        w.releaseLock();
-                        return sock;
-                    };
+                    const activeTargetObj = { value: null };
+                    const result = await connectWithAutoDetect(
+                        host, port, 
+                        intent.host, intent.port, 
+                        intent.payload,
+                        fallbackNode,
+                        activeTargetObj,
+                        intent,
+                        remote
+                    );
 
-                    const s1 = await connectNode(intent.host, intent.port);
-                    SubstreamHandler.pipeTCP(s1, remote, intent.replyHead, async () => {
-                        if (fallbackNode) {
-                            const s2 = await connectNode(host, port);
-                            s2.closed.finally(() => remote.close());
-                            SubstreamHandler.pipeTCP(s2, remote, intent.replyHead, null);
-                        }
-                    });
+                    activeTarget = result.socket;
+
+                    // Jika bukan WebSocket, gunakan pipeTCP biasa
+                    if (!result.isWS) {
+                        SubstreamHandler.pipeTCP(result.socket, remote, intent.replyHead, async () => {
+                            if (fallbackNode) {
+                                const retryResult = await connectWithAutoDetect(
+                                    host, port,
+                                    intent.host, intent.port,
+                                    intent.payload,
+                                    fallbackNode,
+                                    activeTargetObj,
+                                    intent,
+                                    remote
+                                );
+                                retryResult.socket.closed.finally(() => remote.close());
+                                SubstreamHandler.pipeTCP(retryResult.socket, remote, intent.replyHead, null);
+                            }
+                        });
+                    }
+                    // Jika WebSocket, relay sudah diatur di dalam connectWithAutoDetect
                 }
             })).catch(() => remote.close());
 
