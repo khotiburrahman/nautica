@@ -105,17 +105,26 @@ class Socks5Dialer {
         };
     }
 
-    static async readExact(reader, n) {
+    static async readExact(reader, n, timeoutMs = 6000) {
         let out = new Uint8Array(0);
-        while (out.length < n) {
-            const { value, done } = await reader.read();
-            if (done || !value) throw new Error("SOCKS5 stream closed prematurely");
-            out = ByteUtils.merge(out, new Uint8Array(value));
+        const timer = setTimeout(() => {
+            try { reader.cancel("SOCKS5 read timeout"); } catch {}
+        }, timeoutMs);
+
+        try {
+            while (out.length < n) {
+                const { value, done } = await reader.read();
+                if (done || !value) throw new Error("SOCKS5 stream closed prematurely");
+                out = ByteUtils.merge(out, new Uint8Array(value));
+            }
+            return out;
+        } finally {
+            clearTimeout(timer);
         }
-        return out;
     }
 
     static async connectSocks5(cfg, targetHost, targetPort, initialPayload) {
+        console.log(`SOCKS5: dialing ${cfg.host}:${cfg.port} -> ${targetHost}:${targetPort}`);
         const sock = connect({ hostname: cfg.host, port: cfg.port });
         const writer = sock.writable.getWriter();
         const reader = sock.readable.getReader();
@@ -124,8 +133,10 @@ class Socks5Dialer {
             const hasAuth = Boolean(cfg.username || cfg.password);
             await writer.write(new Uint8Array(hasAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
             const methodRes = await this.readExact(reader, 2);
+            console.log(`SOCKS5: methodRes=${methodRes[0]},${methodRes[1]}`);
+
             if (methodRes[0] !== 0x05 || methodRes[1] === 0xff) {
-                throw new Error("SOCKS5 auth method rejected");
+                throw new Error(`SOCKS5 auth method rejected: ${methodRes[1]}`);
             }
 
             if (methodRes[1] === 0x02) {
@@ -136,6 +147,7 @@ class Socks5Dialer {
                     new Uint8Array([p.length]), p
                 ));
                 const authRes = await this.readExact(reader, 2);
+                console.log(`SOCKS5: authRes=${authRes[0]},${authRes[1]}`);
                 if (authRes[1] !== 0x00) throw new Error("SOCKS5 credentials invalid");
             }
 
@@ -148,6 +160,7 @@ class Socks5Dialer {
             await writer.write(reqPacket);
 
             const repHead = await this.readExact(reader, 4);
+            console.log(`SOCKS5: repHead=${repHead[0]},${repHead[1]},${repHead[2]},${repHead[3]}`);
             if (repHead[1] !== 0x00) {
                 throw new Error(`SOCKS5 CONNECT failed code: ${repHead[1]}`);
             }
@@ -161,21 +174,24 @@ class Socks5Dialer {
                 await this.readExact(reader, 18);
             }
 
+            // Lepaskan reader sebelum pipeTCP mengambil alih sock.readable
+            reader.releaseLock();
+
             if (initialPayload?.length) {
                 await writer.write(initialPayload);
             }
-        } catch (err) {
             writer.releaseLock();
-            reader.releaseLock();
-            sock.close();
+            return sock;
+        } catch (err) {
+            console.log(`SOCKS5 ERROR: ${err?.message || err}`);
+            try { writer.releaseLock(); } catch {}
+            try { reader.releaseLock(); } catch {}
+            try { sock.close(); } catch {}
             throw err;
         }
-
-        writer.releaseLock();
-        reader.releaseLock();
-        return sock;
     }
 }
+
 
 // --- [ CRYPTO ENGINE ] ---
 
