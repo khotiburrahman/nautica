@@ -4,7 +4,10 @@ import { connect } from "cloudflare:sockets";
 // Uuid generate di https://www.uuidgenerator.net/version4
 // tambahkan uuid khusus protocol VMESS di const SYSTEM_UUID
 // Khusus protocol VMESS gunakan cipher: zero
-// path config(akun): gunakan /socks5://ip:port atau /socks5://user:pass@ip:port (atau kosongkan seperti semula)
+// path config(akun):
+// - kosong atau /ws (jalur bawaan)
+// - /socks5://host:port atau /socks5://user:pass@host:port
+// - /http://host:port atau /http://user:pass@host:port
 
 const SYSTEM_UUID = "8fc11e59-39ce-4992-b698-5d96f47106bf";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
@@ -89,32 +92,48 @@ class ByteReader {
     }
 }
 
-// --- [ SOCKS5 DIALER ] ---
+// --- [ OUTBOUND PROXY DIALER (SOCKS5 & HTTP CONNECT) ] ---
 
-class Socks5Dialer {
+class ProxyDialer {
     static parsePath(rawPath) {
         if (!rawPath) return null;
         const clean = decodeURIComponent(rawPath.replace(/^\//, ""));
+
         const s5Match = clean.match(/^socks5:\/\/(?:([^:@]+)(?::([^@]*))?@)?([^:\/]+):(\d+)$/i);
-        if (!s5Match) return null;
-        return {
-            username: s5Match[1] || "",
-            password: s5Match[2] || "",
-            host: s5Match[3],
-            port: parseInt(s5Match[4], 10)
-        };
+        if (s5Match) {
+            return {
+                mode: "socks5",
+                username: s5Match[1] || "",
+                password: s5Match[2] || "",
+                host: s5Match[3],
+                port: parseInt(s5Match[4], 10)
+            };
+        }
+
+        const httpMatch = clean.match(/^http:\/\/(?:([^:@]+)(?::([^@]*))?@)?([^:\/]+):(\d+)$/i);
+        if (httpMatch) {
+            return {
+                mode: "http",
+                username: httpMatch[1] || "",
+                password: httpMatch[2] || "",
+                host: httpMatch[3],
+                port: parseInt(httpMatch[4], 10)
+            };
+        }
+
+        return null;
     }
 
     static async readExact(reader, n, timeoutMs = 6000) {
         let out = new Uint8Array(0);
         const timer = setTimeout(() => {
-            try { reader.cancel("SOCKS5 read timeout"); } catch {}
+            try { reader.cancel("Proxy read timeout"); } catch {}
         }, timeoutMs);
 
         try {
             while (out.length < n) {
                 const { value, done } = await reader.read();
-                if (done || !value) throw new Error("SOCKS5 stream closed prematurely");
+                if (done || !value) throw new Error("Proxy stream closed prematurely");
                 out = ByteUtils.merge(out, new Uint8Array(value));
             }
             return out;
@@ -174,14 +193,13 @@ class Socks5Dialer {
                 await this.readExact(reader, 18);
             }
 
-            // Lepaskan reader sebelum pipeTCP mengambil alih sock.readable
             reader.releaseLock();
 
             if (initialPayload?.length) {
                 await writer.write(initialPayload);
             }
             writer.releaseLock();
-            return sock;
+            return { sock, leftover: null };
         } catch (err) {
             console.log(`SOCKS5 ERROR: ${err?.message || err}`);
             try { writer.releaseLock(); } catch {}
@@ -190,8 +208,67 @@ class Socks5Dialer {
             throw err;
         }
     }
-}
 
+    static async connectHttp(cfg, targetHost, targetPort, initialPayload) {
+        console.log(`HTTP: dialing ${cfg.host}:${cfg.port} -> ${targetHost}:${targetPort}`);
+        const sock = connect({ hostname: cfg.host, port: cfg.port });
+        const writer = sock.writable.getWriter();
+        const reader = sock.readable.getReader();
+
+        const timer = setTimeout(() => {
+            try { reader.cancel("HTTP CONNECT timeout"); } catch {}
+        }, 6000);
+
+        try {
+            let reqStr = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+            if (cfg.username || cfg.password) {
+                reqStr += `Proxy-Authorization: Basic ${btoa(`${cfg.username}:${cfg.password}`)}\r\n`;
+            }
+            reqStr += `Proxy-Connection: Keep-Alive\r\n\r\n`;
+            await writer.write(ByteUtils.encode(reqStr));
+
+            let acc = new Uint8Array(0);
+            let sepIdx = -1;
+            while (sepIdx === -1) {
+                const { value, done } = await reader.read();
+                if (done || !value) throw new Error("HTTP proxy closed before 200 OK");
+                acc = ByteUtils.merge(acc, new Uint8Array(value));
+                for (let i = 0; i <= acc.length - 4; i++) {
+                    if (acc[i] === 13 && acc[i + 1] === 10 && acc[i + 2] === 13 && acc[i + 3] === 10) {
+                        sepIdx = i;
+                        break;
+                    }
+                }
+                if (acc.length > 8192) throw new Error("HTTP proxy header too large");
+            }
+
+            const statusLine = ByteUtils.decode(acc.subarray(0, sepIdx)).split("\r\n")[0];
+            console.log(`HTTP: status="${statusLine}"`);
+            if (!/^HTTP\/1\.[01]\s+200/i.test(statusLine)) {
+                throw new Error(`HTTP CONNECT rejected: ${statusLine}`);
+            }
+
+            const rawLeftover = acc.subarray(sepIdx + 4);
+            const leftover = rawLeftover.length > 0 ? rawLeftover : null;
+
+            reader.releaseLock();
+
+            if (initialPayload?.length) {
+                await writer.write(initialPayload);
+            }
+            writer.releaseLock();
+            return { sock, leftover };
+        } catch (err) {
+            console.log(`HTTP ERROR: ${err?.message || err}`);
+            try { writer.releaseLock(); } catch {}
+            try { reader.releaseLock(); } catch {}
+            try { sock.close(); } catch {}
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+}
 
 // --- [ CRYPTO ENGINE ] ---
 
@@ -498,8 +575,19 @@ class SubstreamHandler {
         return tx.writable.getWriter();
     }
 
-    static async pipeTCP(remoteNode, ws, head, retryFn) {
+    static async pipeTCP(remoteNode, ws, head, retryFn, initialChunk = null) {
         let pHead = head, flowActive = false;
+
+        if (initialChunk && initialChunk.length > 0 && ws.readyState === 1) {
+            flowActive = true;
+            if (pHead) {
+                ws.send(ByteUtils.merge(pHead, initialChunk));
+                pHead = null;
+            } else {
+                ws.send(initialChunk);
+            }
+        }
+
         await remoteNode.readable.pipeTo(new WritableStream({
             write(c) {
                 flowActive = true;
@@ -523,7 +611,7 @@ export default {
 
         if (isWs) {
             const urlObj = new URL(req.url);
-            const s5Cfg = Socks5Dialer.parsePath(urlObj.pathname);
+            const proxyCfg = ProxyDialer.parsePath(urlObj.pathname);
 
             const pair = new WebSocketPair();
             const [local, remote] = Object.values(pair);
@@ -564,10 +652,21 @@ export default {
                         return;
                     }
 
-                    if (s5Cfg) {
-                        const sock = await Socks5Dialer.connectSocks5(s5Cfg, intent.host, intent.port, intent.payload);
+                    if (proxyCfg?.mode === "socks5") {
+                        const { sock, leftover } = await ProxyDialer.connectSocks5(
+                            proxyCfg, intent.host, intent.port, intent.payload
+                        );
                         activeTarget = sock;
-                        SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null);
+                        SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null, leftover);
+                        return;
+                    }
+
+                    if (proxyCfg?.mode === "http") {
+                        const { sock, leftover } = await ProxyDialer.connectHttp(
+                            proxyCfg, intent.host, intent.port, intent.payload
+                        );
+                        activeTarget = sock;
+                        SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null, leftover);
                         return;
                     }
 
