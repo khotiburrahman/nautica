@@ -1,18 +1,12 @@
 import { connect } from "cloudflare:sockets";
 
 // sebelum deploy script ubah compatible date jadi 2026-02-24 atau 24 februari 2026 di menu settings CF nya agar akun bisa konek
-
 // Uuid generate di https://www.uuidgenerator.net/version4
-
-// jangan ubah logic dibawah ini
-
 // tambahkan uuid khusus protocol VMESS di const SYSTEM_UUID
-
 // Khusus protocol VMESS gunakan cipher: zero
-
-// path config(akun) gunakan /proxy:port atau /proxy-port contoh /36.95.152.58:12137 /36.95.152.58-12137
-
-// Jika protocol VMESS&TROJAN tidak bisa browsing gunakan DNS 8.8.8.8 atau https://1.1.1.1/dns-query atau ceklis HTTP proxy to VPN atau enable fakeDNS kalau pakai v2rayNG
+// path config(akun):
+// - /socks5://ip:port atau /socks5://user:pass@ip:port
+// - /proxy:port atau /proxy-port (mode fallback lama)
 
 const SYSTEM_UUID = "8fc11e59-39ce-4992-b698-5d96f47106bf";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
@@ -73,14 +67,14 @@ class ByteReader {
         const type = this.u8();
         let target = "";
         switch (type) {
-            case 1: // IPv4
+            case 1:
                 target = this.take(4).join(".");
                 break;
-            case 2: // Domain
+            case 2:
                 target = ByteUtils.decode(this.take(this.u8()));
                 break;
-            case 3: // Domain (Alt/Some protocols)
-            case 4: // IPv6 (Shared mapped ID)
+            case 3:
+            case 4:
                 if (type === 3 && this.has(this.buf[this.cursor])) {
                     target = ByteUtils.decode(this.take(this.u8()));
                 } else {
@@ -97,14 +91,119 @@ class ByteReader {
     }
 }
 
+// --- [ SOCKS5 DIALER ] ---
+
+class Socks5Dialer {
+    static parsePath(rawPath) {
+        if (!rawPath) return null;
+        const clean = decodeURIComponent(rawPath.replace(/^\//, ""));
+
+        // Format: socks5://host:port atau socks5://user:pass@host:port
+        const s5Match = clean.match(/^socks5:\/\/(?:([^:@]+)(?::([^@]*))?@)?([^:\/]+):(\d+)$/i);
+        if (s5Match) {
+            return {
+                mode: "socks5",
+                username: s5Match[1] || "",
+                password: s5Match[2] || "",
+                host: s5Match[3],
+                port: parseInt(s5Match[4], 10)
+            };
+        }
+
+        // Format lama: host:port atau host-port
+        const legacyMatch = clean.match(/^(.+)[:=-](\d+)$/);
+        if (legacyMatch) {
+            return {
+                mode: "fallback",
+                host: legacyMatch[1],
+                port: parseInt(legacyMatch[2], 10)
+            };
+        }
+        return null;
+    }
+
+    static async readExact(reader, n) {
+        let out = new Uint8Array(0);
+        while (out.length < n) {
+            const { value, done } = await reader.read();
+            if (done || !value) throw new Error("SOCKS5 stream closed prematurely");
+            out = ByteUtils.merge(out, new Uint8Array(value));
+        }
+        return out;
+    }
+
+    static async connectSocks5(cfg, targetHost, targetPort, initialPayload) {
+        const sock = connect({ hostname: cfg.host, port: cfg.port });
+        const writer = sock.writable.getWriter();
+        const reader = sock.readable.getReader();
+
+        try {
+            const hasAuth = Boolean(cfg.username || cfg.password);
+            // Greeting: VER(5), NMETHODS, METHODS (0x00 = no auth, 0x02 = user/pass)
+            await writer.write(new Uint8Array(hasAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
+            const methodRes = await this.readExact(reader, 2);
+            if (methodRes[0] !== 0x05 || methodRes[1] === 0xff) {
+                throw new Error("SOCKS5 auth method rejected");
+            }
+
+            if (methodRes[1] === 0x02) {
+                const u = ByteUtils.encode(cfg.username);
+                const p = ByteUtils.encode(cfg.password);
+                await writer.write(ByteUtils.merge(
+                    new Uint8Array([0x01, u.length]), u,
+                    new Uint8Array([p.length]), p
+                ));
+                const authRes = await this.readExact(reader, 2);
+                if (authRes[1] !== 0x00) throw new Error("SOCKS5 credentials invalid");
+            }
+
+            // Request CONNECT ke targetHost:targetPort (ATYP 0x03 = Domain)
+            const hostBytes = ByteUtils.encode(targetHost);
+            const reqPacket = ByteUtils.merge(
+                new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length]),
+                hostBytes,
+                new Uint8Array([targetPort >> 8, targetPort & 0xff])
+            );
+            await writer.write(reqPacket);
+
+            const repHead = await this.readExact(reader, 4);
+            if (repHead[1] !== 0x00) {
+                throw new Error(`SOCKS5 CONNECT failed code: ${repHead[1]}`);
+            }
+
+            // Buang sisa BND.ADDR + BND.PORT
+            if (repHead[3] === 0x01) {
+                await this.readExact(reader, 6);
+            } else if (repHead[3] === 0x03) {
+                const len = (await this.readExact(reader, 1))[0];
+                await this.readExact(reader, len + 2);
+            } else if (repHead[3] === 0x04) {
+                await this.readExact(reader, 18);
+            }
+
+            if (initialPayload?.length) {
+                await writer.write(initialPayload);
+            }
+        } catch (err) {
+            writer.releaseLock();
+            reader.releaseLock();
+            sock.close();
+            throw err;
+        }
+
+        writer.releaseLock();
+        reader.releaseLock();
+        return sock;
+    }
+}
+
 // --- [ CRYPTO ENGINE ] ---
 
 class CryptoEngine {
-    // Standard algorithms kept computationally identical to ensure byte-perfect network compatibility
     static md5(data, salt) {
         let msg = typeof data === 'string' ? ByteUtils.encode(data) : data;
         if (salt) msg = ByteUtils.merge(msg, typeof salt === 'string' ? ByteUtils.encode(salt) : salt);
-        
+
         const K = new Uint32Array([
             0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
             0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
@@ -128,7 +227,7 @@ class CryptoEngine {
         const v = new DataView(padded.buffer);
         v.setUint32(padded.length - 8, (L * 8) >>> 0, true);
         v.setUint32(padded.length - 4, (L * 8 / 0x100000000) >>> 0, true);
-        
+
         for (let i = 0; i < padded.length; i += 64) {
             const M = new Uint32Array(16);
             for (let j = 0; j < 16; j++) M[j] = v.getUint32(i + j * 4, true);
@@ -169,7 +268,7 @@ class CryptoEngine {
         padded.set(msg); padded[L] = 0x80;
         new DataView(padded.buffer).setUint32(padded.length - 4, L * 8, false);
         const W = new Uint32Array(64);
-        
+
         for (let i = 0; i < padded.length; i += 64) {
             const block = new DataView(padded.buffer, i, 64);
             for (let t = 0; t < 16; t++) W[t] = block.getUint32(t * 4, false);
@@ -243,12 +342,7 @@ class ShadowsocksCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
         const { target, port } = reader.readEndpoint();
-        return { 
-            host: target, port, 
-            isUdp: port === 53, 
-            payload: reader.takeRest(), 
-            replyHead: null 
-        };
+        return { host: target, port, isUdp: port === 53, payload: reader.takeRest(), replyHead: null };
     }
 }
 
@@ -256,65 +350,45 @@ class VlessCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
         const ver = reader.u8();
-        reader.take(16); // skip UUID
+        reader.take(16);
         const optLen = reader.u8();
-        reader.take(optLen); // skip options
+        reader.take(optLen);
         const cmd = reader.u8();
-        
+
         const isUdp = (cmd === Constants.CMD_UDP);
         if (cmd !== Constants.CMD_TCP && !isUdp) throw new Error("VLESS Cmd Invalid");
-        
+
         const port = reader.u16();
         const type = reader.u8();
-        
+
         let target = "";
         switch (type) {
-            case 1: // IPv4
-                target = reader.take(4).join(".");
-                break;
-            case 2: // Domain
-                target = ByteUtils.decode(reader.take(reader.u8()));
-                break;
-            case 3: // IPv6
+            case 1: target = reader.take(4).join("."); break;
+            case 2: target = ByteUtils.decode(reader.take(reader.u8())); break;
+            case 3:
                 const parts = [];
                 for (let i = 0; i < 8; i++) parts.push(reader.u16().toString(16));
                 target = parts.join(":");
                 break;
-            default:
-                throw new Error(`VLESS Unknown address format: ${type}`);
+            default: throw new Error(`VLESS Unknown address format: ${type}`);
         }
 
-        return {
-            host: target, port, isUdp,
-            payload: reader.takeRest(),
-            replyHead: new Uint8Array([ver, 0])
-        };
+        return { host: target, port, isUdp, payload: reader.takeRest(), replyHead: new Uint8Array([ver, 0]) };
     }
 }
 
 class TrojanCodec extends BaseCodec {
     async extract(buffer) {
         const reader = new ByteReader(buffer);
-        reader.take(56); // password hash
-        reader.take(2);  // \r\n
-        
+        reader.take(56);
+        reader.take(2);
         const cmd = reader.u8();
         const isUdp = (cmd === Constants.CMD_P1_UDP);
-        
-        reader.cursor--; // rewind for shared logic
-        reader.take(1);  // swallow cmd again properly before endpoint
-        
-        const type = reader.u8();
-        reader.cursor--; 
+        reader.cursor--;
+        reader.take(1);
         const { target, port } = reader.readEndpoint();
-        
-        reader.take(2); // final \r\n
-        
-        return {
-            host: target, port, isUdp,
-            payload: reader.takeRest(),
-            replyHead: null
-        };
+        reader.take(2);
+        return { host: target, port, isUdp, payload: reader.takeRest(), replyHead: null };
     }
 }
 
@@ -326,7 +400,7 @@ class VmessCodec extends BaseCodec {
         const nonce = reader.take(8);
 
         const basis = CryptoEngine.md5(ByteUtils.parseUUID(SYSTEM_UUID), "c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        
+
         const kLen = CryptoEngine.vmessKDF(basis, [Constants.VMESS_SALT.LEN_KEY, auth, nonce]).subarray(0, 16);
         const iLen = CryptoEngine.vmessKDF(basis, [Constants.VMESS_SALT.LEN_IV, auth, nonce]).subarray(0, 12);
         const rawLen = await CryptoEngine.gcmProcess('decrypt', kLen, iLen, lenEnc, auth);
@@ -343,11 +417,10 @@ class VmessCodec extends BaseCodec {
         const kRes = cmdData.subarray(17, 33);
         const vAuth = cmdData[33];
         const port = (cmdData[38] << 8) | cmdData[39];
-        
+
         const cmdReader = new ByteReader(cmdData.subarray(40));
         const { target } = cmdReader.readEndpoint();
 
-        // Prepare reply headers
         const rKeyB = CryptoEngine.sha256(kRes).subarray(0, 16);
         const rIvB = CryptoEngine.sha256(iv).subarray(0, 16);
 
@@ -359,11 +432,7 @@ class VmessCodec extends BaseCodec {
         const rpI = CryptoEngine.vmessKDF(rIvB, [Constants.VMESS_SALT.RES_PAY_I]).subarray(0, 12);
         const h2 = await CryptoEngine.gcmProcess('encrypt', rpK, rpI, new Uint8Array([vAuth, 0, 0, 0]));
 
-        return {
-            host: target, port, isUdp: port === 53,
-            payload,
-            replyHead: ByteUtils.merge(h1, h2)
-        };
+        return { host: target, port, isUdp: port === 53, payload, replyHead: ByteUtils.merge(h1, h2) };
     }
 }
 
@@ -382,17 +451,17 @@ class ConnectionBroker {
                 if (len > 0 && len < 4096) return new VmessCodec();
             } catch {}
         }
-        
+
         if (buffer.length >= 62) {
             const delim = buffer.slice(56, 60);
             if (delim[0] === 0x0d && delim[1] === 0x0a && [1,3,127].includes(delim[2])) {
                 return new TrojanCodec();
             }
         }
-        
+
         const hex = ByteUtils.hex(buffer.slice(1, 17));
         if (/^\w{8}\w{4}4\w{3}[89ab]\w{3}\w{12}$/.test(hex)) return new VlessCodec();
-        
+
         return new ShadowsocksCodec();
     }
 }
@@ -418,7 +487,7 @@ class SubstreamHandler {
                 });
                 const ans = new Uint8Array(await resp.arrayBuffer());
                 const outLen = new Uint8Array([ans.byteLength >> 8, ans.byteLength & 0xff]);
-                
+
                 if (clientWs.readyState === 1) {
                     if (prefixSent || !responsePrefix) {
                         clientWs.send(ByteUtils.merge(outLen, ans));
@@ -444,9 +513,14 @@ class SubstreamHandler {
                     pHead = null;
                 } else ws.send(c);
             }
-        })).catch(() => ws.close());
-        
-        if (!flowActive && retryFn) retryFn();
+        })).catch(() => {
+            if (!flowActive && retryFn) return;
+            try { ws.close(); } catch {}
+        });
+
+        if (!flowActive && retryFn) {
+            await retryFn();
+        }
     }
 }
 
@@ -455,18 +529,18 @@ class SubstreamHandler {
 export default {
     async fetch(req, env, ctx) {
         const isWs = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
-        
+
         if (isWs) {
-            const pathMatch = new URL(req.url).pathname.match(/^\/(.+[:=-]\d+)$/);
-            const fallbackNode = pathMatch ? pathMatch[1] : null;
-            
+            const urlObj = new URL(req.url);
+            const s5Cfg = Socks5Dialer.parsePath(urlObj.pathname);
+
             const pair = new WebSocketPair();
             const [local, remote] = Object.values(pair);
             remote.accept();
-            
+
             const ed = req.headers.get("sec-websocket-protocol");
             const firstPacket = ByteUtils.b64Decode(ed);
-            
+
             let activeTarget = null, dnsWriter = null;
 
             const wsStream = new ReadableStream({
@@ -499,10 +573,17 @@ export default {
                         return;
                     }
 
-                    const host = fallbackNode ? fallbackNode.split(/[:=-]/)[0] : intent.host;
-                    const port = fallbackNode ? parseInt(fallbackNode.split(/[:=-]/)[1], 10) : intent.port;
-                    
-                    const connectNode = async (h, p) => {
+                    // Mode SOCKS5 eksplisit: langsung konek lewat proxy SOCKS5
+                    if (s5Cfg && s5Cfg.mode === "socks5") {
+                        const sock = await Socks5Dialer.connectSocks5(s5Cfg, intent.host, intent.port, intent.payload);
+                        activeTarget = sock;
+                        sock.closed.finally(() => { try { remote.close(); } catch {} });
+                        await SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null);
+                        return;
+                    }
+
+                    // Mode default / fallback lama: direct dulu, jika gagal/CF IP baru ke fallback host:port
+                    const dialDirect = async (h, p) => {
                         const sock = connect({ hostname: h, port: p });
                         activeTarget = sock;
                         const w = sock.writable.getWriter();
@@ -511,19 +592,22 @@ export default {
                         return sock;
                     };
 
-                    const s1 = await connectNode(intent.host, intent.port);
-                    SubstreamHandler.pipeTCP(s1, remote, intent.replyHead, async () => {
-                        if (fallbackNode) {
-                            const s2 = await connectNode(host, port);
-                            s2.closed.finally(() => remote.close());
-                            SubstreamHandler.pipeTCP(s2, remote, intent.replyHead, null);
+                    const s1 = await dialDirect(intent.host, intent.port);
+                    await SubstreamHandler.pipeTCP(s1, remote, intent.replyHead, async () => {
+                        if (s5Cfg && s5Cfg.mode === "fallback") {
+                            const s2 = await dialDirect(s5Cfg.host, s5Cfg.port);
+                            activeTarget = s2;
+                            s2.closed.finally(() => { try { remote.close(); } catch {} });
+                            await SubstreamHandler.pipeTCP(s2, remote, intent.replyHead, null);
+                        } else {
+                            try { remote.close(); } catch {}
                         }
                     });
                 }
-            })).catch(() => remote.close());
+            })).catch(() => { try { remote.close(); } catch {} });
 
             return new Response(null, {
-                status: 101, webSocket: local, 
+                status: 101, webSocket: local,
                 headers: ed ? { "Sec-WebSocket-Protocol": ed } : {}
             });
         }
