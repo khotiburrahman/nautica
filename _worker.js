@@ -4,9 +4,7 @@ import { connect } from "cloudflare:sockets";
 // Uuid generate di https://www.uuidgenerator.net/version4
 // tambahkan uuid khusus protocol VMESS di const SYSTEM_UUID
 // Khusus protocol VMESS gunakan cipher: zero
-// path config(akun):
-// - /socks5://ip:port atau /socks5://user:pass@ip:port
-// - /proxy:port atau /proxy-port (mode fallback lama)
+// path config(akun): gunakan /socks5://ip:port atau /socks5://user:pass@ip:port (atau kosongkan seperti semula)
 
 const SYSTEM_UUID = "8fc11e59-39ce-4992-b698-5d96f47106bf";
 const DOH_ENDPOINT = "https://1.1.1.1/dns-query";
@@ -97,29 +95,14 @@ class Socks5Dialer {
     static parsePath(rawPath) {
         if (!rawPath) return null;
         const clean = decodeURIComponent(rawPath.replace(/^\//, ""));
-
-        // Format: socks5://host:port atau socks5://user:pass@host:port
         const s5Match = clean.match(/^socks5:\/\/(?:([^:@]+)(?::([^@]*))?@)?([^:\/]+):(\d+)$/i);
-        if (s5Match) {
-            return {
-                mode: "socks5",
-                username: s5Match[1] || "",
-                password: s5Match[2] || "",
-                host: s5Match[3],
-                port: parseInt(s5Match[4], 10)
-            };
-        }
-
-        // Format lama: host:port atau host-port
-        const legacyMatch = clean.match(/^(.+)[:=-](\d+)$/);
-        if (legacyMatch) {
-            return {
-                mode: "fallback",
-                host: legacyMatch[1],
-                port: parseInt(legacyMatch[2], 10)
-            };
-        }
-        return null;
+        if (!s5Match) return null;
+        return {
+            username: s5Match[1] || "",
+            password: s5Match[2] || "",
+            host: s5Match[3],
+            port: parseInt(s5Match[4], 10)
+        };
     }
 
     static async readExact(reader, n) {
@@ -139,7 +122,6 @@ class Socks5Dialer {
 
         try {
             const hasAuth = Boolean(cfg.username || cfg.password);
-            // Greeting: VER(5), NMETHODS, METHODS (0x00 = no auth, 0x02 = user/pass)
             await writer.write(new Uint8Array(hasAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
             const methodRes = await this.readExact(reader, 2);
             if (methodRes[0] !== 0x05 || methodRes[1] === 0xff) {
@@ -157,7 +139,6 @@ class Socks5Dialer {
                 if (authRes[1] !== 0x00) throw new Error("SOCKS5 credentials invalid");
             }
 
-            // Request CONNECT ke targetHost:targetPort (ATYP 0x03 = Domain)
             const hostBytes = ByteUtils.encode(targetHost);
             const reqPacket = ByteUtils.merge(
                 new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length]),
@@ -171,7 +152,6 @@ class Socks5Dialer {
                 throw new Error(`SOCKS5 CONNECT failed code: ${repHead[1]}`);
             }
 
-            // Buang sisa BND.ADDR + BND.PORT
             if (repHead[3] === 0x01) {
                 await this.readExact(reader, 6);
             } else if (repHead[3] === 0x03) {
@@ -513,14 +493,9 @@ class SubstreamHandler {
                     pHead = null;
                 } else ws.send(c);
             }
-        })).catch(() => {
-            if (!flowActive && retryFn) return;
-            try { ws.close(); } catch {}
-        });
+        })).catch(() => ws.close());
 
-        if (!flowActive && retryFn) {
-            await retryFn();
-        }
+        if (!flowActive && retryFn) retryFn();
     }
 }
 
@@ -573,16 +548,13 @@ export default {
                         return;
                     }
 
-                    // Mode SOCKS5 eksplisit: langsung konek lewat proxy SOCKS5
-                    if (s5Cfg && s5Cfg.mode === "socks5") {
+                    if (s5Cfg) {
                         const sock = await Socks5Dialer.connectSocks5(s5Cfg, intent.host, intent.port, intent.payload);
                         activeTarget = sock;
-                        sock.closed.finally(() => { try { remote.close(); } catch {} });
-                        await SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null);
+                        SubstreamHandler.pipeTCP(sock, remote, intent.replyHead, null);
                         return;
                     }
 
-                    // Mode default / fallback lama: direct dulu, jika gagal/CF IP baru ke fallback host:port
                     const dialDirect = async (h, p) => {
                         const sock = connect({ hostname: h, port: p });
                         activeTarget = sock;
@@ -593,18 +565,13 @@ export default {
                     };
 
                     const s1 = await dialDirect(intent.host, intent.port);
-                    await SubstreamHandler.pipeTCP(s1, remote, intent.replyHead, async () => {
-                        if (s5Cfg && s5Cfg.mode === "fallback") {
-                            const s2 = await dialDirect(s5Cfg.host, s5Cfg.port);
-                            activeTarget = s2;
-                            s2.closed.finally(() => { try { remote.close(); } catch {} });
-                            await SubstreamHandler.pipeTCP(s2, remote, intent.replyHead, null);
-                        } else {
-                            try { remote.close(); } catch {}
-                        }
+                    SubstreamHandler.pipeTCP(s1, remote, intent.replyHead, async () => {
+                        const s2 = await dialDirect(intent.host, intent.port);
+                        s2.closed.finally(() => remote.close());
+                        SubstreamHandler.pipeTCP(s2, remote, intent.replyHead, null);
                     });
                 }
-            })).catch(() => { try { remote.close(); } catch {} });
+            })).catch(() => remote.close());
 
             return new Response(null, {
                 status: 101, webSocket: local,
